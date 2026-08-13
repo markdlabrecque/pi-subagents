@@ -46,6 +46,18 @@ Agent-specific system instructions.
 
 Omit `model` to inherit the parent's selected model. Thinking resolution is per-call override, then profile `thinking`, then parent level. Development-workflow injects its validated persisted role thinking as the per-call value only for workflow-lifecycle dispatches when the caller did not explicitly provide `thinking`; this happens again on resumed jobs. Terminal calls are unchanged. `maxTokens` is an optional positive-integer output limit. Its resolution is per-call override, then a persisted workflow-agent limit on resume, then profile `maxTokens`, then the development-workflow role limit. Invalid values are ignored; effective limits are clamped to the selected model's configured `maxTokens`. Terminal calls without a per-call/profile limit do not receive a token override. Supported profile thinking values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; invalid thinking profiles are ignored. A tool-call `model` override has highest priority. Tool allowlists are configured per profile; omitting `tools` uses Pi's default active tools except `subagent`.
 
+### Profiles versus development-workflow roles
+
+A profile selects a prompt and tools; it does not create a development-workflow authority role. Development-workflow lifecycle calls accept only exact `agentId` values `planner`, `implementer`, `test-writer`, `reviewer`, and `reporter`. Spelling variants such as `test_writer` and semantic aliases such as `auditor` are not normalized or inferred.
+
+Use auxiliary profiles through an ordinary terminal dispatch instead:
+
+```ts
+{ agent: "researcher", task: "Investigate ..." }
+```
+
+Omit `lifecycle`, `workflowId`, and `agentId`; never invent a workflow role for an auxiliary profile.
+
 ## Isolation and lifecycle
 
 - Terminal lifecycle (the default) preserves the original one-job behavior.

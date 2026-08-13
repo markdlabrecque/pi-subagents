@@ -269,6 +269,59 @@ test("mutex ownership is atomically published and contention is abortable", asyn
   }
 });
 
+test("exceptional workflow timing distinguishes pre-persist and resumed attempts", () => {
+  const endedAt = Date.parse("2026-08-13T12:00:10.000Z");
+  const startedAt = endedAt - 4_000;
+  const lastEndedAt = new Date(startedAt - 6_000).toISOString();
+  const beforePersist = { activeRunMs: 1_000, idleWaitingMs: 2_000, lastEndedAt };
+  assert.equal(subagentModule.settleExceptionalWorkflowTiming(beforePersist, startedAt, endedAt, false), true);
+  assert.deepEqual(beforePersist, { activeRunMs: 5_000, idleWaitingMs: 8_000, lastEndedAt });
+
+  const resumed = { activeRunMs: 1_000, idleWaitingMs: 8_000, lastEndedAt };
+  assert.equal(subagentModule.settleExceptionalWorkflowTiming(resumed, startedAt, endedAt, true), true);
+  assert.deepEqual(resumed, { activeRunMs: 5_000, idleWaitingMs: 8_000, lastEndedAt }, "a persisted resume already charged its idle interval");
+  assert.equal(subagentModule.settleExceptionalWorkflowTiming(resumed, undefined, endedAt, false), false, "setup failures before a run starts do not invent active timing");
+});
+
+test("workflow setup failures retain their original error", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-setup-failure-"));
+  const workflowId = `setup-failure-${process.pid}-${Date.now()}`;
+  const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
+  const workflowDir = path.resolve(root, "..", "..", "runtime", "subagent-workflows", workflowId);
+  const tools = new Map();
+  try {
+    await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
+    await writeFile(path.join(cwd, ".pi", "agents", "researcher.md"), "---\nname: researcher\ndescription: test profile\n---\nResearch only.\n");
+    await mkdir(workflowDir, { recursive: true });
+    const priorEnd = "2026-08-13T12:00:00.000Z";
+    await writeFile(path.join(workflowDir, "workflow.json"), JSON.stringify({
+      workflowId, runDir, createdAt: priorEnd, updatedAt: priorEnd,
+      agents: { researcher: { workflowId, agentId: "researcher", profile: "researcher", sessionDir: path.join(runDir, "session-researcher"), status: "done", thinking: "medium", cwd, createdAt: priorEnd, updatedAt: priorEnd, ownerId: `${workflowId}:researcher`, activeRunMs: 10, idleWaitingMs: 20, lastEndedAt: priorEnd, reason: "prior result" } },
+    }));
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "coord"), "force mkdir failure");
+    const pi = {
+      events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); },
+      getThinkingLevel() { return "medium"; },
+    };
+    subagentModule.default(pi);
+    const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
+    const error = await tools.get("subagent").execute("setup", {
+      action: "run", lifecycle: "workflow", workflowId, agentId: "researcher", agent: "researcher", task: "research", agentScope: "project", confirmProjectAgents: false,
+    }, undefined, undefined, ctx).then(() => undefined, failure => failure);
+    assert.equal(error?.code, "EEXIST");
+    assert.doesNotMatch(String(error?.message), /workflowStartedAt|not defined/);
+    const retained = JSON.parse(await readFile(path.join(workflowDir, "workflow.json"), "utf8"));
+    assert.equal(retained.agents.researcher.reason, "prior result");
+    assert.equal(retained.agents.researcher.activeRunMs, 10);
+    assert.equal(retained.agents.researcher.idleWaitingMs, 20);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true });
+    await rm(workflowDir, { recursive: true, force: true });
+  }
+});
+
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {
   const extensions = [path.join(root, "index.ts"), path.join(developmentRoot, "index.ts")];
   for (const args of [extensions.flatMap(extension => ["-e", extension]), ["-e", extensions[0]], ["-e", extensions[1]]]) {

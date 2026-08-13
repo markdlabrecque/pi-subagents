@@ -360,6 +360,10 @@ export default function (pi: ExtensionAPI) {
         workflowRuns.set(workflowRunId, new Promise<void>(resolve => { release = resolve; }));
         releaseWorkflowRun = () => { workflowRuns.delete(workflowRunId); release(); };
       }
+      // These values must remain initialized even when registry/setup work throws;
+      // the catch path uses them to settle any pre-existing workflow record.
+      let workflowStartedAt: number | undefined;
+      let workflowAttemptPersisted = false;
       try {
         const runId = workflowLifecycle ? `workflow-${safeId(params.workflowId!)}` : `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         const runDir = workflowLifecycle ? path.join(RUN_ROOT, runId) : path.join(RUN_ROOT, runId); const lockDir = path.join(runDir, "coord");
@@ -379,8 +383,6 @@ export default function (pi: ExtensionAPI) {
           }
         }
         const timeout = (params.timeoutMinutes ?? DEFAULT_TIMEOUT_MS / 60_000) * 60_000;
-        let workflowStartedAt: number | undefined;
-        let workflowAttemptPersisted = false;
 
       const runOne = async (spec: TaskSpec, index: number, prior = ""): Promise<RunResult> => {
         const agent = requested[specs.indexOf(spec)]!;
