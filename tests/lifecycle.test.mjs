@@ -43,7 +43,7 @@ test("active agents use a responsive horizontal boxed-card widget", () => {
   assert.match(widgetLayout, /truncateToWidth\(joined, width, ""\)/);
   assert.match(index, /currentToolStartedAt = Date\.now\(\)/);
   assert.match(index, /currentToolElapsed:/);
-  assert.match(widgetLayout, /waiting for tool/);
+  assert.match(widgetLayout, /thinking\.\.\./);
   assert.doesNotMatch(widgetLayout, /card\.task/);
 });
 
@@ -152,12 +152,12 @@ test("development workflow coordinates the subagent close action before state re
   assert.match(development, /pi\.on\("tool_result", \(event: any\) => \{.*if \(event\.toolName === "development_workflow" && event\.input\?\.action === "complete" && !event\.isError\) trackCompletionToolCall/s);
   assert.match(development, /while \(completionToolCalls\.size >= MAX_TRACKED_COMPLETION_TOOL_CALLS\)/);
   assert.match(development, /pi\.on\("agent_end", \(\) => \{\s+completionToolCalls\.clear\(\)/);
-  assert.match(development, /pi\.on\("session_shutdown", event => \{.*completionToolCalls\.clear\(\)/s);
+  assert.match(development, /pi\.on\("session_shutdown", async event => \{.*completionToolCalls\.clear\(\)/s);
   assert.match(development, /message\?\.role !== "toolResult" \|\| !completionToolCalls\.delete\(message\.toolCallId\)/);
   assert.match(development, /message\.toolName !== "development_workflow".*state\?\.stage !== "completed"/s);
   assert.match(development, /setTimeout\(\(\) => \{\s+void closeCompletedAfterForegroundResult/s);
   assert.doesNotMatch(development, /pi\.on\("message_end", async/);
-  assert.match(development, /if \(currentId === state\.id\) \{\s+const next = \(await listStates\(\)\)\.filter\(candidate => !\["completed", "blocked", "aborted"\]\.includes\(candidate\.stage\)\)\.sort\(\(a, b\) => b\.updatedAt\.localeCompare\(a\.updatedAt\)\)\[0\];\s+currentId = next\?\.id;/s);
+  assert.match(development, /await retireState\(state\.id\);\s+stateCache\.delete\(state\.id\);\s+untrackWorkflowId\(state\.id\);/s);
   assert.match(development, /void closeCompletedAfterForegroundResult\(state\.id\)/);
   assert.doesNotMatch(development, /Also call subagent closeWorkflow/);
 });

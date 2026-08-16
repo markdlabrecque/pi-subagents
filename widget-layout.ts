@@ -37,7 +37,7 @@ function cardLines(card: AgentCard, width: number, style: CardStyle): string[] {
   ];
   const tool = card.currentTool
     ? `↳ ${card.currentTool}${card.currentToolElapsed ? ` · ${card.currentToolElapsed}` : ""}`
-    : "↳ waiting for tool";
+    : "↳ thinking...";
   const toolLines = wrapTextWithAnsi(tool, inner).slice(0, 2);
   content.push(...toolLines.map(line => fit(style.accent(line), inner)));
   content.push(fit(style.muted(`ctx ${card.contextTokens.toLocaleString()} · ${card.lockCount} locks`), inner));

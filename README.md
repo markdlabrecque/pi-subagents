@@ -83,4 +83,4 @@ Workflow `list` details report cumulative active run time separately from persis
 
 ## UI
 
-The `Agents` widget shows each active agent in a boxed card with its name, elapsed time, model/thinking level, current tool call and tool duration, context usage, and lock count. While no tool is active, it shows `waiting for tool`. Cards are arranged horizontally across the available terminal width and wrap onto additional rows on narrower screens.
+The `Agents` widget shows each active agent in a boxed card with its name, elapsed time, model/thinking level, current tool call and tool duration, context usage, and lock count. While no tool is active, it shows `thinking...`. Cards are arranged horizontally across the available terminal width and wrap onto additional rows on narrower screens.
