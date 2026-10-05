@@ -121,7 +121,7 @@ const Params = Type.Object({
   thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
   freshSession: Type.Optional(Type.Boolean({ description: "Start a fresh workflow child context instead of resuming its prior session" })),
-  // Set only by development-workflow from its persisted role configuration.
+  // Set only by a trusted workflow extension from its persisted role configuration.
   workflowMaxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Internal workflow role output-token limit" })),
   tasks: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
   chain: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),

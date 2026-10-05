@@ -7,9 +7,7 @@ import path from "node:path";
 import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
-const developmentRoot = path.resolve(root, "..", "development-workflow");
 const index = await readFile(path.join(root, "index.ts"), "utf8");
-const development = await readFile(path.join(developmentRoot, "index.ts"), "utf8");
 const guard = await readFile(path.join(root, "child-guard.ts"), "utf8");
 const widgetLayout = await readFile(path.join(root, "widget-layout.ts"), "utf8");
 const globalNodeModules = spawnSync("npm", ["root", "-g"], { encoding: "utf8" }).stdout.trim();
@@ -115,51 +113,34 @@ test("cleanup and failure retention are explicit", () => {
   assert.match(index, /await mutateWorkflow\(params\.workflowId!/);
 });
 
-test("development workflow has no widget or subagent widget telemetry", () => {
-  assert.doesNotMatch(development, /setWidget\("development-workflow"/);
-  assert.doesNotMatch(development, /development-workflow:agent/);
+test("agent widget has no development-workflow telemetry", () => {
   assert.doesNotMatch(index, /development-workflow:agent/);
   assert.match(index, /setWidget\("subagents", \(_tui, theme\) =>/);
 });
 
-test("workflow mode is process-local rather than session-file handed off", async () => {
-  const threadMode = await readFile(path.join(developmentRoot, "thread-mode.ts"), "utf8");
-  assert.match(threadMode, /Symbol\.for\("development-workflow\.enabled\.v2"\)/);
-  assert.match(threadMode, /LEGACY_WORKFLOW_MODE_KEY/);
-  assert.match(threadMode, /return root\[WORKFLOW_MODE_KEY\] \?\?= false/);
-  assert.match(development, /workflowModeEnabled\(\)/);
-  assert.doesNotMatch(development, /WeakMap|pendingReplacement|SessionManager\.open|pi\.appendEntry|previousSessionFile|THREAD_MODE_ENTRY/);
-  assert.match(development, /const workflowActive = \(\): boolean => workflowModeEnabled\(\) \|\| foregroundActivated \|\| pendingForegroundActivation \|\| preflightForegroundActivation \|\| isWorkflowChildSession\(\)/);
-  assert.match(development, /pi\.setActiveTools\(workflowActive\(\) \? \[\.\.\.new Set\(\[\.\.\.active, "development_workflow"\]\)\] : active\.filter\(name => name !== "development_workflow"\)\)/);
-  assert.match(development, /setStatus\("development-workflow", undefined\)/);
-  assert.match(development, /hasWorkflowTrigger\(event\.text \?\? ""\)/);
-  assert.match(development, /const activeForPrompt = workflowActive\(\)/);
-  assert.match(development, /if \(!activeForPrompt\) return undefined/);
-  assert.match(development, /return \{ systemPrompt:/);
-  // Disabled foreground calls are blocked, while persistent workflow children retain
-  // access to record their own stage results.
-  assert.match(development, /pi\.on\("tool_call", async \(event, ctx\) => \{.*if \(event\.toolName === "development_workflow"\) \{/s);
-  assert.match(development, /if \(workflowActive\(\)\) return undefined/);
-  assert.match(development, /childWorkflowAccessError/);
-  assert.match(development, /if \(!workflowActive\(\)\) throw new Error\("Development workflow is inactive/);
-  for (const command of ["workflow-enable", "workflow-disable"]) assert.match(development, new RegExp(`registerCommand\\("${command}"`));
-});
-
-test("development workflow coordinates the subagent close action before state removal", () => {
-  assert.match(development, /pi\.events\.emit\("subagent:request", request\)/);
-  assert.match(development, /const text = await requestSubagentClose\(pi, state\.id\);\s+await retireState\(state\.id\);/s);
-  assert.match(development, /const MAX_TRACKED_COMPLETION_TOOL_CALLS = 256/);
-  assert.match(development, /pi\.on\("tool_result", \(event: any\) => \{.*if \(event\.toolName === "development_workflow" && event\.input\?\.action === "complete" && !event\.isError\) trackCompletionToolCall/s);
-  assert.match(development, /while \(completionToolCalls\.size >= MAX_TRACKED_COMPLETION_TOOL_CALLS\)/);
-  assert.match(development, /pi\.on\("agent_end", \(\) => \{\s+completionToolCalls\.clear\(\)/);
-  assert.match(development, /pi\.on\("session_shutdown", async event => \{.*completionToolCalls\.clear\(\)/s);
-  assert.match(development, /message\?\.role !== "toolResult" \|\| !completionToolCalls\.delete\(message\.toolCallId\)/);
-  assert.match(development, /message\.toolName !== "development_workflow".*state\?\.stage !== "completed"/s);
-  assert.match(development, /setTimeout\(\(\) => \{\s+void closeCompletedAfterForegroundResult/s);
-  assert.doesNotMatch(development, /pi\.on\("message_end", async/);
-  assert.match(development, /await retireState\(state\.id\);\s+stateCache\.delete\(state\.id\);\s+untrackWorkflowId\(state\.id\);/s);
-  assert.match(development, /void closeCompletedAfterForegroundResult\(state\.id\)/);
-  assert.doesNotMatch(development, /Also call subagent closeWorkflow/);
+test("other extensions offer profiles through the global provider map", async () => {
+  const agentsModule = await jiti.import(path.join(root, "agents.ts"));
+  const key = Symbol.for("pi-subagents.agent-providers");
+  const saved = globalThis[key];
+  try {
+    globalThis[key] = new Map([
+      ["ok", () => [{ name: "ext:worker", description: "d", tools: ["read", "bash"], thinking: "high", systemPrompt: "Do it.", filePath: "/x/worker.md" }]],
+      ["bad-thinking", () => [{ name: "ext:bad", description: "d", thinking: "huge", systemPrompt: "x" }]],
+      ["throws", () => { throw new Error("boom"); }],
+      ["not-a-list", () => "nope"],
+    ]);
+    const { agents } = agentsModule.discoverAgents(os.tmpdir(), "user");
+    const worker = agents.find(a => a.name === "ext:worker");
+    assert.ok(worker);
+    assert.deepEqual(worker.tools, ["read", "bash"]);
+    assert.equal(worker.thinking, "high");
+    assert.equal(worker.source, "user");
+    assert.equal(worker.systemPrompt, "Do it.");
+    assert.equal(agents.find(a => a.name === "ext:bad"), undefined);
+    assert.doesNotMatch(await readFile(path.join(root, "agents.ts"), "utf8"), /development-workflow/);
+  } finally {
+    if (saved === undefined) delete globalThis[key]; else globalThis[key] = saved;
+  }
 });
 
 test("guard blocks cross-owner edits and restores shell mutations", () => {
@@ -323,8 +304,8 @@ test("workflow setup failures retain their original error", async () => {
 });
 
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {
-  const extensions = [path.join(root, "index.ts"), path.join(developmentRoot, "index.ts")];
-  for (const args of [extensions.flatMap(extension => ["-e", extension]), ["-e", extensions[0]], ["-e", extensions[1]]]) {
+  const extensions = [path.join(root, "index.ts")];
+  for (const args of [extensions.flatMap(extension => ["-e", extension])]) {
     const result = spawnSync("pi", ["--list-models", ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   }

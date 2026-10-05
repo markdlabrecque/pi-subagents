@@ -105,12 +105,58 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
+/**
+ * Other extensions offer agent profiles without writing files: they register
+ * a provider in this global map (shared by every extension in the process,
+ * whatever its module root), keyed by their own name:
+ *
+ *   const key = Symbol.for("pi-subagents.agent-providers");
+ *   (globalThis[key] ??= new Map()).set("my-extension", () => [{ name, description, tools?, model?, thinking?, maxTokens?, systemPrompt, filePath }]);
+ *
+ * Providers are called on every discovery and count as user-scope profiles.
+ * A profile in ~/.pi/agent/agents with the same name wins.
+ */
+export const AGENT_PROVIDERS = Symbol.for("pi-subagents.agent-providers");
+
+const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function loadProvidedAgents(): AgentConfig[] {
+	const providers = (globalThis as Record<symbol, unknown>)[AGENT_PROVIDERS];
+	if (!(providers instanceof Map)) return [];
+	const agents: AgentConfig[] = [];
+	for (const [owner, provide] of providers) {
+		let list: unknown;
+		try {
+			list = typeof provide === "function" ? provide() : undefined;
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		for (const a of list) {
+			if (!a || typeof a.name !== "string" || typeof a.description !== "string" || typeof a.systemPrompt !== "string") continue;
+			if (a.thinking !== undefined && !THINKING.includes(a.thinking)) continue;
+			const maxTokens = Number.isSafeInteger(a.maxTokens) && a.maxTokens > 0 ? a.maxTokens : undefined;
+			agents.push({
+				name: a.name,
+				description: a.description,
+				tools: Array.isArray(a.tools) && a.tools.length > 0 ? a.tools.map(String) : undefined,
+				model: typeof a.model === "string" ? a.model : undefined,
+				thinking: a.thinking,
+				maxTokens,
+				systemPrompt: a.systemPrompt,
+				source: "user",
+				filePath: typeof a.filePath === "string" ? a.filePath : `provider:${owner}`,
+			});
+		}
+	}
+	return agents;
+}
+
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
-	const bundledWorkflowDir = path.join(getAgentDir(), "extensions", "development-workflow", "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
-	const userAgents = scope === "project" ? [] : [...loadAgentsFromDir(userDir, "user"), ...loadAgentsFromDir(bundledWorkflowDir, "user")];
+	const userAgents = scope === "project" ? [] : [...loadProvidedAgents(), ...loadAgentsFromDir(userDir, "user")];
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();
