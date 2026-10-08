@@ -8,10 +8,10 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const index = await readFile(path.join(root, "index.ts"), "utf8");
-const guard = await readFile(path.join(root, "child-guard.ts"), "utf8");
 const widgetLayout = await readFile(path.join(root, "widget-layout.ts"), "utf8");
 const globalNodeModules = spawnSync("npm", ["root", "-g"], { encoding: "utf8" }).stdout.trim();
-const piRoot = path.join(globalNodeModules, "@earendil-works", "pi-coding-agent");
+const localPiRoot = path.join(os.homedir(), ".local", "lib", "node_modules", "@earendil-works", "pi-coding-agent");
+const piRoot = await stat(path.join(localPiRoot, "package.json")).then(() => localPiRoot, () => path.join(globalNodeModules, "@earendil-works", "pi-coding-agent"));
 const piRequire = createRequire(path.join(piRoot, "package.json"));
 const createJiti = piRequire("jiti");
 const nodeModules = path.join(piRoot, "node_modules");
@@ -21,8 +21,83 @@ const jiti = createJiti(import.meta.url, { moduleCache: false, alias: {
   "@earendil-works/pi-tui": path.join(nodeModules, "@earendil-works", "pi-tui", "dist", "index.js"),
   typebox: piRequire.resolve("typebox"),
 } });
+const testAgentDir = await mkdtemp(path.join(os.tmpdir(), "pi-test-agent-runtime-"));
+const inheritedAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = testAgentDir;
 const subagentModule = await jiti.import(path.join(root, "index.ts"));
-const childGuardModule = await jiti.import(path.join(root, "child-guard.ts"));
+if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
+test.after(() => rm(testAgentDir, { recursive: true, force: true }));
+
+async function hookFixture(t) {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-unguarded-child-"));
+  const coord = path.join(cwd, "coord");
+  await mkdir(coord);
+  const saved = { PI_SUBAGENT_ID: process.env.PI_SUBAGENT_ID, PI_SUBAGENT_COORD_DIR: process.env.PI_SUBAGENT_COORD_DIR, PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD };
+  Object.assign(process.env, { PI_SUBAGENT_ID: "stage-two", PI_SUBAGENT_COORD_DIR: coord, PI_SUBAGENT_CHILD: "1" });
+  t.after(async () => {
+    for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await rm(cwd, { recursive: true, force: true });
+  });
+  const hooks = new Map();
+  const fresh = createJiti(import.meta.url, { moduleCache: false });
+  (await fresh.import(path.join(root, "child-guard.ts"))).default({ on(name, handler) { hooks.set(name, handler); } });
+  const call = async (toolName, input, toolCallId) => hooks.get("tool_call")?.({ toolName, input, toolCallId }, { cwd });
+  const result = async (toolName, toolCallId) => hooks.get("tool_result")?.({ toolName, toolCallId, content: [{ type: "text", text: "ok" }], isError: false }, { cwd });
+  return { cwd, coord, call, result };
+}
+
+for (const toolName of ["edit", "write"]) {
+  for (const owner of ["preexisting", "stage-one"]) {
+    test(`child ${toolName} permits formerly ${owner} files`, async t => {
+      const f = await hookFixture(t);
+      const file = path.join(f.cwd, "shared.txt");
+      await writeFile(file, "prior stage\n");
+      await writeFile(path.join(f.coord, "registry.json"), JSON.stringify({ roots: [f.cwd], owners: { [file]: owner } }));
+      const decision = await f.call(toolName, { path: file }, "direct");
+      assert.notEqual(decision?.block, true, decision?.reason);
+      await writeFile(file, "next stage\n");
+      assert.notEqual((await f.result(toolName, "direct"))?.isError, true);
+      assert.equal(await readFile(file, "utf8"), "next stage\n");
+    });
+  }
+}
+
+test("child shell modifications are not restored or reported as lock failures", async t => {
+  const f = await hookFixture(t);
+  const file = path.join(f.cwd, "shared.txt");
+  await writeFile(file, "prior stage\n");
+  await writeFile(path.join(f.coord, "registry.json"), JSON.stringify({ roots: [f.cwd], owners: { [file]: "stage-one" } }));
+  assert.notEqual((await f.call("bash", { command: "stub mutation" }, "shell"))?.block, true);
+  const shell = spawnSync("sh", ["-c", 'printf "next stage\\n" > shared.txt'], { cwd: f.cwd });
+  assert.equal(shell.status, 0);
+  const result = await f.result("bash", "shell");
+  assert.equal(await readFile(file, "utf8"), "next stage\n", "shell output must survive tool_result");
+  assert.notEqual(result?.isError, true);
+});
+
+test("child permits multiple bash calls in one turn without coordination files", async t => {
+  const f = await hookFixture(t);
+  await writeFile(path.join(f.coord, "registry.json"), JSON.stringify({ roots: [f.cwd], owners: {} }));
+  assert.notEqual((await f.call("bash", { command: "true" }, "first"))?.block, true);
+  // Sibling calls must not wait on a mutation mutex held by the first call.
+  const sibling = await f.call("bash", { command: "true" }, "second");
+  await f.result("bash", "first");
+  assert.notEqual(sibling?.block, true, sibling?.reason);
+  await f.result("bash", "second");
+  assert.notEqual((await f.call("bash", { command: "true" }, "third"))?.block, true);
+  await f.result("bash", "third");
+  await assert.rejects(stat(path.join(f.coord, "mutation.mutex")), { code: "ENOENT" });
+  await assert.rejects(stat(path.join(f.coord, "failure-stage-two.txt")), { code: "ENOENT" });
+});
+
+test("nested delegation remains blocked without ownership coordination", async t => {
+  const f = await hookFixture(t);
+  await rm(f.coord, { recursive: true });
+  const decision = await f.call("subagent", { agent: "worker", task: "nested" }, "nested");
+  assert.equal(decision?.block, true);
+  assert.match(decision.reason, /sub.?subagents|nested|cannot delegate/i);
+});
 const maxTokensOverride = await jiti.import(path.join(root, "max-tokens-override.ts"));
 
 test("terminal API remains present and workflow API is additive", () => {
@@ -143,113 +218,6 @@ test("other extensions offer profiles through the global provider map", async ()
   }
 });
 
-test("guard blocks cross-owner edits and restores shell mutations", () => {
-  assert.match(guard, /owner && owner !== id/);
-  assert.match(guard, /await restore\(file/);
-  assert.match(guard, /Shell lock violation/);
-  assert.match(guard, /registry\.owners\[file\] = id!/);
-});
-
-test("bash auditing ignores unchanged preexisting dirty files", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "already-dirty.txt");
-  try {
-    const original = Buffer.from("user change\n");
-    await writeFile(file, original);
-    const registry = { owners: { [file]: "preexisting" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, []);
-    assert.equal(registry.owners[file], "preexisting");
-    assert.equal(await readFile(file, "utf8"), "user change\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("bash auditing lets the active agent claim a changed preexisting file", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "already-dirty.txt");
-  try {
-    const original = Buffer.from("user change\n");
-    await writeFile(file, "agent update\n");
-    const registry = { owners: { [file]: "preexisting" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, []);
-    assert.equal(registry.owners[file], "workflow:test-agent");
-    assert.equal(await readFile(file, "utf8"), "agent update\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("bash auditing still restores files owned by another agent", async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "foreign.txt");
-  try {
-    const original = Buffer.from("other agent's work\n");
-    await writeFile(file, "unauthorized update\n");
-    const registry = { owners: { [file]: "workflow:other-agent" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, [`${file} (owned by workflow:other-agent)`]);
-    assert.equal(registry.owners[file], "workflow:other-agent");
-    assert.equal(await readFile(file, "utf8"), "other agent's work\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("mutation lock reclaims dead owners without disturbing live or replacement locks", () => {
-  assert.match(guard, /process\.kill\(pid, 0\)/);
-  assert.match(guard, /!processIsAlive\(owner\.pid\)/);
-  assert.match(guard, /owner\?\.token !== token/);
-  assert.match(guard, /return async \(\) => \{ await removeOwnedMutex\(token\); \}/);
-  assert.match(guard, /await fs\.promises\.link\(temp, mutexPath\)/);
-});
-
-test("mutation lock waiting is bounded and abortable", () => {
-  assert.match(guard, /PI_SUBAGENT_MUTEX_WAIT_MS/);
-  assert.match(guard, /Timed out after.*waiting for the mutation lock/);
-  assert.match(guard, /signal\?\.addEventListener\("abort"/);
-  assert.match(guard, /Aborted while waiting for the mutation lock/);
-});
-
-test("mutex ownership is atomically published and contention is abortable", async () => {
-  const coord = await mkdtemp(path.join(os.tmpdir(), "pi-mutex-test-"));
-  process.env.PI_SUBAGENT_ID = "test-agent";
-  process.env.PI_SUBAGENT_COORD_DIR = coord;
-  process.env.PI_SUBAGENT_MUTEX_WAIT_MS = "2000";
-  const mutex = path.join(coord, "mutation.mutex");
-  try {
-    const { acquireMutationLock } = await import(`../child-guard.ts?test=${Date.now()}`);
-    const release = await acquireMutationLock();
-    const owner = JSON.parse(await readFile(mutex, "utf8"));
-    assert.equal(owner.pid, process.pid);
-    const controller = new AbortController();
-    const blocked = acquireMutationLock(controller.signal);
-    controller.abort();
-    await assert.rejects(blocked, /Aborted while waiting/);
-    await release();
-    await assert.rejects(stat(mutex), { code: "ENOENT" });
-  } finally {
-    await rm(coord, { recursive: true, force: true });
-    delete process.env.PI_SUBAGENT_ID;
-    delete process.env.PI_SUBAGENT_COORD_DIR;
-    delete process.env.PI_SUBAGENT_MUTEX_WAIT_MS;
-  }
-});
-
 test("exceptional workflow timing distinguishes pre-persist and resumed attempts", () => {
   const endedAt = Date.parse("2026-08-13T12:00:10.000Z");
   const startedAt = endedAt - 4_000;
@@ -268,7 +236,7 @@ test("workflow setup failures retain their original error", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-setup-failure-"));
   const workflowId = `setup-failure-${process.pid}-${Date.now()}`;
   const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
-  const workflowDir = path.resolve(root, "..", "..", "runtime", "subagent-workflows", workflowId);
+  const workflowDir = path.join(testAgentDir, "runtime", "subagent-workflows", workflowId);
   const tools = new Map();
   try {
     await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
@@ -280,12 +248,14 @@ test("workflow setup failures retain their original error", async () => {
       agents: { researcher: { workflowId, agentId: "researcher", profile: "researcher", sessionDir: path.join(runDir, "session-researcher"), status: "done", thinking: "medium", cwd, createdAt: priorEnd, updatedAt: priorEnd, ownerId: `${workflowId}:researcher`, activeRunMs: 10, idleWaitingMs: 20, lastEndedAt: priorEnd, reason: "prior result" } },
     }));
     await mkdir(runDir, { recursive: true });
-    await writeFile(path.join(runDir, "coord"), "force mkdir failure");
+    await writeFile(path.join(runDir, "session-researcher"), "force lifecycle session mkdir failure");
     const pi = {
       events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); },
       getThinkingLevel() { return "medium"; },
     };
-    subagentModule.default(pi);
+    const childFlag = process.env.PI_SUBAGENT_CHILD;
+    delete process.env.PI_SUBAGENT_CHILD;
+    try { subagentModule.default(pi); } finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
     const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
     const error = await tools.get("subagent").execute("setup", {
       action: "run", lifecycle: "workflow", workflowId, agentId: "researcher", agent: "researcher", task: "research", agentScope: "project", confirmProjectAgents: false,
@@ -301,6 +271,105 @@ test("workflow setup failures retain their original error", async () => {
     await rm(runDir, { recursive: true, force: true });
     await rm(workflowDir, { recursive: true, force: true });
   }
+});
+
+test("stub dispatch retains workflow exclusion and metadata without automatic commits", async t => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-dispatch-stub-"));
+  const workflowId = `stub-${process.pid}-${Date.now()}`;
+  const workflowDir = path.join(testAgentDir, "runtime", "subagent-workflows", workflowId);
+  const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
+  const priorScript = process.argv[1];
+  t.after(async () => {
+    process.argv[1] = priorScript;
+    await rm(cwd, { recursive: true, force: true });
+    await rm(workflowDir, { recursive: true, force: true });
+    await rm(runDir, { recursive: true, force: true });
+  });
+  await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
+  await writeFile(path.join(cwd, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ndescription: readonly stub\ntools: read\n---\nReview only.\n");
+  const script = path.join(cwd, "stub.cjs");
+  await writeFile(script, `const fs = require('node:fs'); const path = require('node:path');
+const args = process.argv.slice(2); const prompt = fs.readFileSync(args[args.indexOf('--append-system-prompt') + 1], 'utf8');
+fs.writeFileSync(path.join(process.cwd(), 'observed.json'), JSON.stringify({ args, prompt }));
+if (args.at(-1).includes('fail fixture')) { console.error('stub failure diagnostics'); process.exit(7); }
+const role = process.env.PI_WORKFLOW_ROLE;
+const finish = () => console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:role === 'auditor' ? 'stub audit complete' : 'stub review complete'}],stopReason:'stop'}}));
+if (role) {
+  fs.writeFileSync(path.join(process.cwd(), 'ready-' + role), 'ready');
+  const deadline = Date.now() + 5000;
+  const timer = setInterval(() => {
+    if (['reviewer', 'auditor'].every(id => fs.existsSync(path.join(process.cwd(), 'ready-' + id)))) { clearInterval(timer); finish(); }
+    else if (Date.now() > deadline) { console.error('distinct workflow roles did not overlap'); process.exit(8); }
+  }, 10);
+} else setTimeout(finish, 200);
+`);
+  process.argv[1] = script;
+  const tools = new Map();
+  const childFlag = process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_CHILD;
+  try { subagentModule.default({ events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, getThinkingLevel() { return "medium"; } }); }
+  finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
+  const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() {} } };
+  const execute = (params, signal) => tools.get("subagent").execute("stub", { agent: "reviewer", task: "read-only review", agentScope: "project", confirmProjectAgents: false, ...params }, signal, undefined, ctx);
+  const terminal = await execute({});
+  assert.equal(terminal.details.results[0].status, "done");
+  await assert.rejects(stat(path.join(cwd, ".git")), { code: "ENOENT" });
+  await assert.rejects(stat(path.dirname(terminal.details.results[0].sessionDir)), { code: "ENOENT" });
+  const git = (...args) => {
+    const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
+  };
+  git("init", "-b", "main"); git("config", "user.name", "Fixture"); git("config", "user.email", "fixture@example.invalid");
+  git("add", ".pi/agents/reviewer.md"); git("commit", "-m", "Read-only baseline");
+  const baseline = git("rev-parse", "HEAD");
+  const pending = execute({ lifecycle: "workflow", workflowId, agentId: "reviewer" });
+  const sibling = execute({ lifecycle: "workflow", workflowId, agentId: "auditor", task: "read-only audit" });
+  await assert.rejects(execute({ lifecycle: "workflow", workflowId, agentId: "reviewer" }), /already running or closing/);
+  const [workflow, audit] = await Promise.all([pending, sibling]);
+  assert.equal(git("rev-parse", "HEAD"), baseline, "read-only dispatch must not commit arbitrary child output");
+  assert.equal(workflow.details.results[0].status, "done");
+  const record = JSON.parse(await readFile(path.join(workflowDir, "workflow.json"), "utf8"));
+  assert.equal(record.agents.reviewer.lastResult, "stub review complete");
+  assert.equal(record.agents.reviewer.status, "done");
+  assert.ok(record.agents.reviewer.activeRunMs >= 0);
+  assert.equal(audit.details.results[0].status, "done", "distinct roles must dispatch concurrently");
+  assert.deepEqual(Object.keys(record.agents).sort(), ["auditor", "reviewer"], "serialized metadata updates must preserve both roles");
+  for (const [agentId, result, task, output] of [
+    ["reviewer", workflow.details.results[0], "read-only review", "stub review complete"],
+    ["auditor", audit.details.results[0], "read-only audit", "stub audit complete"],
+  ]) {
+    const agent = record.agents[agentId];
+    assert.equal(agent.workflowId, workflowId);
+    assert.equal(agent.agentId, agentId);
+    assert.equal(agent.ownerId, `${workflowId}:${agentId}`);
+    assert.equal(agent.status, "done");
+    assert.equal(agent.lastTask, task);
+    assert.equal(agent.lastResult, output);
+    assert.equal(agent.sessionDir, result.sessionDir);
+    assert.ok(agent.activeRunMs >= 0);
+    assert.ok(Number.isFinite(Date.parse(agent.lastEndedAt)));
+    assert.ok((await stat(agent.sessionDir)).isDirectory());
+  }
+  assert.notEqual(record.agents.reviewer.sessionDir, record.agents.auditor.sessionDir);
+  await execute({ action: "closeWorkflow", workflowId });
+  await assert.rejects(stat(workflowDir), { code: "ENOENT" });
+  const failure = (await execute({ task: "fail fixture" })).details.results[0];
+  t.after(() => rm(path.dirname(failure.sessionDir), { recursive: true, force: true }));
+  assert.equal(failure.status, "failed");
+  assert.equal(failure.exitCode, 7);
+  assert.match(failure.reason, /stub failure diagnostics/);
+  assert.ok((await stat(failure.sessionDir)).isDirectory(), "failed diagnostics are retained");
+  const controller = new AbortController();
+  const cancellation = execute({}, controller.signal);
+  setTimeout(() => controller.abort(), 50);
+  const aborted = (await cancellation).details.results[0];
+  t.after(() => rm(path.dirname(aborted.sessionDir), { recursive: true, force: true }));
+  assert.equal(aborted.status, "aborted");
+  assert.equal(aborted.reason, "Aborted by parent");
+  assert.ok((await stat(aborted.sessionDir)).isDirectory());
+  const observed = JSON.parse(await readFile(path.join(cwd, "observed.json"), "utf8"));
+  assert.doesNotMatch(observed.prompt, /file.lock|ownership|mutation mutex/i);
+  assert.equal("lockCount" in workflow.details.results[0], false, "no lock counters in observable results");
 });
 
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {

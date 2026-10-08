@@ -70,7 +70,7 @@ export function settleExceptionalWorkflowTiming(record: { activeRunMs?: number; 
 }
 interface ActiveTask extends TaskSpec {
   id: string; status: Status; startedAt?: number; currentTool?: string; currentToolStartedAt?: number; modelUsed?: string; thinkingUsed?: ThinkingLevel;
-  maxTokens?: number; contextTokens: number; lockCount: number; output?: string; reason?: string; sessionDir?: string;
+  maxTokens?: number; contextTokens: number; output?: string; reason?: string; sessionDir?: string;
 }
 interface RunResult extends ActiveTask { exitCode: number; usage: { input: number; output: number; cost: number; turns: number }; }
 interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: RunResult[]; workflows?: WorkflowRecord[]; }
@@ -161,20 +161,6 @@ async function removeOldFailedRuns(): Promise<void> {
     if (stat && Date.now() - stat.mtimeMs > FAILED_RETENTION_MS) await fs.promises.rm(p, { recursive: true, force: true });
   }
 }
-async function gitDirty(cwd: string): Promise<string[]> {
-  return new Promise((resolve) => {
-    const p = spawn("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd, stdio: ["ignore", "pipe", "ignore"] });
-    let s = ""; p.stdout.on("data", d => s += d); p.on("close", code => {
-      if (code !== 0) return resolve([]);
-      const files: string[] = [];
-      for (const entry of s.split("\0").filter(Boolean)) {
-        const raw = entry.slice(3); const target = raw.includes(" -> ") ? raw.split(" -> ").pop()! : raw;
-        files.push(path.resolve(cwd, target));
-      }
-      resolve(files);
-    });
-  });
-}
 function piInvocation(args: string[]): { command: string; args: string[] } {
   const script = process.argv[1];
   if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) return { command: process.execPath, args: [script, ...args] };
@@ -206,7 +192,6 @@ export default function (pi: ExtensionAPI) {
           currentTool: a.currentTool,
           currentToolElapsed: a.currentToolStartedAt ? `${Math.floor((Date.now() - a.currentToolStartedAt) / 1000)}s` : undefined,
           contextTokens: a.contextTokens,
-          lockCount: a.lockCount,
         }));
         const title = truncateToWidth(theme.fg("muted", `Agents (${rows.length} active)`), Math.max(0, width), "");
         const grid = renderAgentGrid(cards, width, {
@@ -286,7 +271,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use subagent in single mode unless the user explicitly requests parallel agents.",
       "Do not delegate trivial work; use subagent for bounded tasks benefiting from isolated context.",
-      "Subagents cannot create other subagents, and file mutations are guarded by cross-process locks.",
+      "Subagents cannot create other subagents. Callers must serialize writing stages in an isolated worktree; parallel same-worktree mutation is unsafe.",
     ],
     parameters: Params,
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -366,29 +351,14 @@ export default function (pi: ExtensionAPI) {
       let workflowAttemptPersisted = false;
       try {
         const runId = workflowLifecycle ? `workflow-${safeId(params.workflowId!)}` : `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-        const runDir = workflowLifecycle ? path.join(RUN_ROOT, runId) : path.join(RUN_ROOT, runId); const lockDir = path.join(runDir, "coord");
-        const roots = [...new Set(specs.map(s => path.resolve(s.cwd ?? ctx.cwd)))];
-        if (workflowLifecycle) await mutateWorkflow(params.workflowId!, async () => {
-          await fs.promises.mkdir(lockDir, { recursive: true });
-          if (!fs.existsSync(path.join(lockDir, "registry.json"))) {
-            const blocked = (await Promise.all(roots.map(gitDirty))).flat();
-            await fs.promises.writeFile(path.join(lockDir, "registry.json"), JSON.stringify({ owners: Object.fromEntries(blocked.map(f => [f, "preexisting"])), roots }, null, 2));
-          }
-        });
-        else {
-          await fs.promises.mkdir(lockDir, { recursive: true });
-          if (!fs.existsSync(path.join(lockDir, "registry.json"))) {
-            const blocked = (await Promise.all(roots.map(gitDirty))).flat();
-            await fs.promises.writeFile(path.join(lockDir, "registry.json"), JSON.stringify({ owners: Object.fromEntries(blocked.map(f => [f, "preexisting"])), roots }, null, 2));
-          }
-        }
+        const runDir = path.join(RUN_ROOT, runId);
         const timeout = (params.timeoutMinutes ?? DEFAULT_TIMEOUT_MS / 60_000) * 60_000;
 
       const runOne = async (spec: TaskSpec, index: number, prior = ""): Promise<RunResult> => {
         const agent = requested[specs.indexOf(spec)]!;
         const id = workflowLifecycle ? `${safeId(params.workflowId!)}:${safeId(params.agentId!)}` : `${runId}-${index + 1}`;
         const task = prior ? spec.task.replace(/\{previous\}/g, prior) : spec.task;
-        const state: ActiveTask = { ...spec, task, id, status: "queued", contextTokens: 0, lockCount: 0, workflowId: workflowLifecycle ? params.workflowId : undefined, agentId: workflowLifecycle ? params.agentId : undefined };
+        const state: ActiveTask = { ...spec, task, id, status: "queued", contextTokens: 0, workflowId: workflowLifecycle ? params.workflowId : undefined, agentId: workflowLifecycle ? params.agentId : undefined };
         active.set(id, state); updateWidget();
         // Fresh reviewers get a new directory/context. The running-run guard above
         // makes this reset safe: it never deletes a live persisted session.
@@ -416,7 +386,7 @@ export default function (pi: ExtensionAPI) {
           workflowAttemptPersisted = true;
         }
         const promptFile = path.join(runDir, `prompt-${index + 1}.md`);
-        await fs.promises.writeFile(promptFile, `${agent.systemPrompt}\n\nYou are a child subagent. You cannot delegate to other agents. Respect all file-lock failures. Report completion, files changed, and unresolved issues.`);
+        await fs.promises.writeFile(promptFile, `${agent.systemPrompt}\n\nYou are a child subagent. You cannot delegate to other agents. Report completion, files changed, and unresolved issues.`);
         const args = ["--mode", "json", "-p", "--session-dir", sessionDir];
         if (!params.freshSession && existing?.sessionFile && fs.existsSync(existing.sessionFile)) args.push("--session", existing.sessionFile);
         args.push("--name", `subagent:${agent.name}:${id}`, "--extension", CHILD_GUARD, "--exclude-tools", "subagent", "--append-system-prompt", promptFile);
@@ -438,7 +408,7 @@ export default function (pi: ExtensionAPI) {
           // Keep the sanitized run ID for subagent internals, but hand the raw workflow
           // identity to workflow tools in separate fields. Encoding both in the run ID is
           // lossy for arbitrary user-supplied workflow IDs.
-          const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_ID: id, PI_SUBAGENT_COORD_DIR: lockDir,
+          const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_ID: id,
             ...(workflowLifecycle ? { PI_WORKFLOW_ID: params.workflowId!, PI_WORKFLOW_ROLE: params.agentId! } : {}) };
           if (maxTokens !== undefined) env.PI_SUBAGENT_MAX_TOKENS = String(maxTokens);
           const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd ?? ctx.cwd, stdio: ["ignore", "pipe", "pipe"], env });
@@ -462,9 +432,6 @@ export default function (pi: ExtensionAPI) {
           child.stderr.on("data", d => stderr += d.toString()); child.on("error", e => { stderr += e.message; finish(1); });
           child.on("close", code => { if (buffer.trim()) line(buffer); finish(code ?? 1); });
         });
-        try { const registry = JSON.parse(await fs.promises.readFile(path.join(lockDir, "registry.json"), "utf8")); state.lockCount = Object.values(registry.owners ?? {}).filter(v => v === id).length; } catch {}
-        const guardFailure = await fs.promises.readFile(path.join(lockDir, `failure-${id}.txt`), "utf8").catch(() => "");
-        if (guardFailure) state.reason = guardFailure.trim();
         const output = trimOutput(finalText(messages)); const failed = exitCode !== 0 || stopReason === "error" || stopReason === "aborted" || Boolean(state.reason);
         state.status = failed ? (state.reason === "Aborted by parent" ? "aborted" : "failed") : "done"; state.output = output; state.reason ||= errorMessage || (failed ? stderr.trim() || `Child exited with code ${exitCode}` : undefined); state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget();
         active.delete(id); updateWidget();
