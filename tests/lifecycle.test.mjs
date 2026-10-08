@@ -292,7 +292,16 @@ test("stub dispatch retains workflow exclusion and metadata without automatic co
 const args = process.argv.slice(2); const prompt = fs.readFileSync(args[args.indexOf('--append-system-prompt') + 1], 'utf8');
 fs.writeFileSync(path.join(process.cwd(), 'observed.json'), JSON.stringify({ args, prompt }));
 if (args.at(-1).includes('fail fixture')) { console.error('stub failure diagnostics'); process.exit(7); }
-setTimeout(() => { console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'stub review complete'}],stopReason:'stop'}})); }, 200);
+const role = process.env.PI_WORKFLOW_ROLE;
+const finish = () => console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:role === 'auditor' ? 'stub audit complete' : 'stub review complete'}],stopReason:'stop'}}));
+if (role) {
+  fs.writeFileSync(path.join(process.cwd(), 'ready-' + role), 'ready');
+  const deadline = Date.now() + 5000;
+  const timer = setInterval(() => {
+    if (['reviewer', 'auditor'].every(id => fs.existsSync(path.join(process.cwd(), 'ready-' + id)))) { clearInterval(timer); finish(); }
+    else if (Date.now() > deadline) { console.error('distinct workflow roles did not overlap'); process.exit(8); }
+  }, 10);
+} else setTimeout(finish, 200);
 `);
   process.argv[1] = script;
   const tools = new Map();
@@ -314,14 +323,34 @@ setTimeout(() => { console.log(JSON.stringify({type:'message_end',message:{role:
   git("add", ".pi/agents/reviewer.md"); git("commit", "-m", "Read-only baseline");
   const baseline = git("rev-parse", "HEAD");
   const pending = execute({ lifecycle: "workflow", workflowId, agentId: "reviewer" });
+  const sibling = execute({ lifecycle: "workflow", workflowId, agentId: "auditor", task: "read-only audit" });
   await assert.rejects(execute({ lifecycle: "workflow", workflowId, agentId: "reviewer" }), /already running or closing/);
-  const workflow = await pending;
+  const [workflow, audit] = await Promise.all([pending, sibling]);
   assert.equal(git("rev-parse", "HEAD"), baseline, "read-only dispatch must not commit arbitrary child output");
   assert.equal(workflow.details.results[0].status, "done");
   const record = JSON.parse(await readFile(path.join(workflowDir, "workflow.json"), "utf8"));
   assert.equal(record.agents.reviewer.lastResult, "stub review complete");
   assert.equal(record.agents.reviewer.status, "done");
   assert.ok(record.agents.reviewer.activeRunMs >= 0);
+  assert.equal(audit.details.results[0].status, "done", "distinct roles must dispatch concurrently");
+  assert.deepEqual(Object.keys(record.agents).sort(), ["auditor", "reviewer"], "serialized metadata updates must preserve both roles");
+  for (const [agentId, result, task, output] of [
+    ["reviewer", workflow.details.results[0], "read-only review", "stub review complete"],
+    ["auditor", audit.details.results[0], "read-only audit", "stub audit complete"],
+  ]) {
+    const agent = record.agents[agentId];
+    assert.equal(agent.workflowId, workflowId);
+    assert.equal(agent.agentId, agentId);
+    assert.equal(agent.ownerId, `${workflowId}:${agentId}`);
+    assert.equal(agent.status, "done");
+    assert.equal(agent.lastTask, task);
+    assert.equal(agent.lastResult, output);
+    assert.equal(agent.sessionDir, result.sessionDir);
+    assert.ok(agent.activeRunMs >= 0);
+    assert.ok(Number.isFinite(Date.parse(agent.lastEndedAt)));
+    assert.ok((await stat(agent.sessionDir)).isDirectory());
+  }
+  assert.notEqual(record.agents.reviewer.sessionDir, record.agents.auditor.sessionDir);
   await execute({ action: "closeWorkflow", workflowId });
   await assert.rejects(stat(workflowDir), { code: "ENOENT" });
   const failure = (await execute({ task: "fail fixture" })).details.results[0];

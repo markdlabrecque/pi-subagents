@@ -16,7 +16,7 @@ test("serial authorized stages preserve red baseline, same-file changes and squa
     return r.stdout.trim();
   };
   const childEnv = { ...process.env }; delete childEnv.NODE_TEST_CONTEXT;
-  const run = () => spawnSync(process.execPath, ["--test", "stage.test.mjs"], { cwd, encoding: "utf8", env: childEnv });
+  const run = () => spawnSync(process.execPath, ["--test", "--test-reporter=tap", "stage.test.mjs"], { cwd, encoding: "utf8", env: childEnv });
   git("init", "-b", "main");
   git("config", "user.name", "Fixture"); git("config", "user.email", "fixture@example.invalid");
   await writeFile(path.join(cwd, "stage.test.mjs"), 'import assert from "node:assert/strict"; import test from "node:test"; const implemented = false; test("stage behavior", () => assert.equal(implemented, false));\n');
@@ -29,13 +29,45 @@ test("serial authorized stages preserve red baseline, same-file changes and squa
   assert.equal(run().status, 1, "expected red is authorized test-stage output");
   git("add", "stage.test.mjs"); git("commit", "-m", "Authorized red test stage");
   const red = git("rev-parse", "HEAD");
-  await writeFile(path.join(cwd, "stage.test.mjs"), redSource.replace("const implemented = false", "const implemented = true"));
+  const partialSource = redSource.replace("const implemented = false", "const implemented = Boolean(0)");
+  await writeFile(path.join(cwd, "stage.test.mjs"), partialSource);
+  const failing = run();
+  assert.equal(failing.status, 1);
+  assert.match(failing.stdout, /not ok 1 - stage behavior/);
+  const checkpointEvidence = {
+    authorized: true, stage: "implementation", status: "incomplete", successfulHandoff: false,
+    scope: ["stage.test.mjs"], outstandingWork: ["Replace the placeholder value and rerun the stage test"],
+    tests: { command: "node --test --test-reporter=tap stage.test.mjs", exitCode: failing.status, output: failing.stdout },
+  };
+  git("add", "stage.test.mjs");
+  git("commit", "-m", "Authorized incomplete implementation checkpoint", "-m", JSON.stringify(checkpointEvidence));
+  const checkpoint = git("rev-parse", "HEAD");
+  assert.notEqual(checkpoint, red);
+  assert.equal(git("status", "--porcelain"), "");
+  assert.match(git("diff", red, checkpoint, "--", "stage.test.mjs"), /implemented = Boolean\(0\)/);
+  await writeFile(path.join(cwd, "stage.test.mjs"), partialSource.replace("const implemented = Boolean(0)", "const implemented = true"));
   assert.equal(run().status, 0);
   git("add", "stage.test.mjs"); git("commit", "-m", "Implementation stage edits same file");
   const green = git("rev-parse", "HEAD");
   assert.notEqual(red, green);
   assert.match(git("diff", red, green, "--", "stage.test.mjs"), /implemented = true/);
   assert.match(git("diff", baseline, red, "--", "stage.test.mjs"), /assert.equal\(implemented, true\)/);
+  const recovered = { sha: git("rev-parse", `${checkpoint}^{commit}`), ...JSON.parse(git("show", "-s", "--format=%b", checkpoint)) };
+  assert.equal(recovered.sha, checkpoint);
+  assert.deepEqual(recovered, { sha: checkpoint, ...checkpointEvidence });
+  assert.equal(recovered.authorized, true);
+  assert.equal(recovered.stage, "implementation");
+  assert.equal(recovered.status, "incomplete", "a checkpoint is not a successful implementation handoff");
+  assert.equal(recovered.successfulHandoff, false);
+  assert.deepEqual(recovered.scope, ["stage.test.mjs"]);
+  assert.deepEqual(recovered.outstandingWork, ["Replace the placeholder value and rerun the stage test"]);
+  assert.equal(recovered.tests.exitCode, 1);
+  assert.match(recovered.tests.output, /not ok 1 - stage behavior/);
+  git("checkout", recovered.sha, "--", "stage.test.mjs");
+  assert.equal(await readFile(path.join(cwd, "stage.test.mjs"), "utf8"), partialSource);
+  const recoveredRun = run();
+  assert.equal(recoveredRun.status, recovered.tests.exitCode, "recovery preserves the unfinished, failing work");
+  assert.match(recoveredRun.stdout, /not ok 1 - stage behavior/);
   git("checkout", baseline, "--", "stage.test.mjs"); assert.equal(run().status, 0);
   git("checkout", green, "--", "stage.test.mjs"); assert.equal(run().status, 0);
   git("reset", "--soft", baseline); git("commit", "-m", "Final squash");
