@@ -67,22 +67,32 @@ Providers are called on every discovery, so edits to their sources apply to the 
 - Each child gets its own persisted session directory while running.
 - Successful terminal run directories and sessions are deleted after all tasks finish.
 - Failed run directories remain under the system temporary directory for 24 hours, and their paths are returned to the parent.
-- `closeWorkflow` is the single cleanup action used by both the `subagent` tool and trusted inter-extension requests. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first registry write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
+- `closeWorkflow` is the single cleanup action used by both the `subagent` tool and trusted inter-extension requests. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first metadata write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
 - `closeAgent` likewise waits for a running child, clears its active-widget entry, removes successful sessions, and retains aborted/failed agent diagnostics for 24 hours.
-- A workflow agent rejects a concurrent run for the same stable `(workflowId, agentId)`. Workflow registry and ownership-registry updates are serialized across agents in the same workflow.
+- A workflow agent rejects a concurrent run for the same stable `(workflowId, agentId)`. Workflow metadata updates are serialized across agents in the same workflow. This does not serialize their file changes.
 - Chains stop at the first failed child.
 - Child agents cannot invoke `subagent`.
 
-## File safety
+## Version 1.0 breaking release notes
 
-The parent initializes a cross-process ownership registry. Files already dirty in Git are protected as `preexisting`. `edit` and `write` acquire an atomic mutation mutex and claim their canonical target path. The owning child may continue editing its claimed files; other children are blocked.
+1.0 removes file ownership enforcement, preexisting-file protection, the mutation mutex, shell backups, auditing and restoration, mutation failure records and counters, and the per-turn bash limit. Children can edit the same file in successive stages and use normal shell tools without extension-managed coordination files. Nested delegation prevention, same-role workflow run exclusion, metadata synchronization, cancellation, cleanup and failed-run retention remain.
 
-A child may issue at most one `bash` call per assistant turn; a same-turn sibling is immediately blocked with combine-commands guidance rather than waiting for the mutation mutex. `read`, `grep`, and `find` remain parallel-safe. All permitted child `bash` calls are serialized. Before shell execution, files owned by other agents are backed up. After execution, Git status and protected-file contents are checked. Newly changed files are claimed by that child; unauthorized changes are restored and reported as lock violations. Non-Git paths use canonical runtime ownership where a target is known.
+This extension does not automatically commit any child work, including Git tasks. Read-only and non-Git tasks need no commits. Stage commits require caller authorization, not merely a child dispatch. No package or release publication is part of this change.
 
-This is deliberately conservative and reduces mutation parallelism. Commands that modify files outside Git and outside already known protected paths cannot always be discovered by Git status; agent prompts instruct children to use `edit`/`write` and honor lock failures.
+### Migration to serial stage handoffs
+
+Callers must manage serial writing stages in an isolated Git worktree. Run only one writing agent at a time, including shell commands and repairs. Parallel same-worktree mutation remains unsafe. Parallel read-only work is appropriate only when it cannot race with a writer. There is no single-writer enforcement and no sandbox: subprocess isolation separates sessions, not filesystem permissions. Git does not protect uncommitted, ignored, external or shared files.
+
+Before each writing stage, inspect the branch, HEAD SHA and dirty status. Surface unexpected work before writing. Inherited partial work requires explicit authorization before continuing; do not assume that a prior dispatch authorized its adoption or removal.
+
+For an authorized stage commit, explicitly stage only task-scoped files, for example `git add -- parser.ts tests/parser.test.mjs`, rather than staging the entire checkout. Hand off the commit SHA, changed scope, actual test commands and results, and outstanding work. Expected red tests are successful test-stage output when the caller authorized that stage; they are not a successful implementation handoff. Implementors may edit the same files in the next serial stage.
+
+Read-only reviewers never commit. Repairs commit their fixes and report the new SHA. Authorized recoverable partial work may be saved as an explicitly incomplete checkpoint, but never presented as successful stage output. Failed stages report diagnostics and unresolved work without silently committing.
+
+Keep intermediate commits through review. Compare the original test baseline, the test-stage changes and each implementation/repair stage diff so acceptance tests cannot be quietly weakened. After repairs or rebases, rerun the tests and bind review to the actual resulting SHA, not a superseded revision. Squash only the final PR after review, preserving intended changes and the recorded stage handoffs.
 
 Workflow `list` details report cumulative active run time separately from persistent idle/waiting time, so between-dispatch waiting is never charged as active execution.
 
 ## UI
 
-The `Agents` widget shows each active agent in a boxed card with its name, elapsed time, model/thinking level, current tool call and tool duration, context usage, and lock count. While no tool is active, it shows `thinking...`. Cards are arranged horizontally across the available terminal width and wrap onto additional rows on narrower screens.
+The `Agents` widget shows each active agent in a boxed card with its name, elapsed time, model/thinking level, current tool call and tool duration, context usage. While no tool is active, it shows `thinking...`. Cards are arranged horizontally across the available terminal width and wrap onto additional rows on narrower screens.

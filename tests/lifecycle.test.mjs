@@ -8,7 +8,6 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const index = await readFile(path.join(root, "index.ts"), "utf8");
-const guard = await readFile(path.join(root, "child-guard.ts"), "utf8");
 const widgetLayout = await readFile(path.join(root, "widget-layout.ts"), "utf8");
 const globalNodeModules = spawnSync("npm", ["root", "-g"], { encoding: "utf8" }).stdout.trim();
 const localPiRoot = path.join(os.homedir(), ".local", "lib", "node_modules", "@earendil-works", "pi-coding-agent");
@@ -29,7 +28,6 @@ const subagentModule = await jiti.import(path.join(root, "index.ts"));
 if (inheritedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 else process.env.PI_CODING_AGENT_DIR = inheritedAgentDir;
 test.after(() => rm(testAgentDir, { recursive: true, force: true }));
-const childGuardModule = await jiti.import(path.join(root, "child-guard.ts"));
 
 async function hookFixture(t) {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-unguarded-child-"));
@@ -217,113 +215,6 @@ test("other extensions offer profiles through the global provider map", async ()
     assert.doesNotMatch(await readFile(path.join(root, "agents.ts"), "utf8"), /development-workflow/);
   } finally {
     if (saved === undefined) delete globalThis[key]; else globalThis[key] = saved;
-  }
-});
-
-test("guard blocks cross-owner edits and restores shell mutations", { skip: "Retired in 1.0: caller manages serial writing stages" }, () => {
-  assert.match(guard, /owner && owner !== id/);
-  assert.match(guard, /await restore\(file/);
-  assert.match(guard, /Shell lock violation/);
-  assert.match(guard, /registry\.owners\[file\] = id!/);
-});
-
-test("bash auditing ignores unchanged preexisting dirty files", { skip: "Retired in 1.0: no shell auditing" }, async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "already-dirty.txt");
-  try {
-    const original = Buffer.from("user change\n");
-    await writeFile(file, original);
-    const registry = { owners: { [file]: "preexisting" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, []);
-    assert.equal(registry.owners[file], "preexisting");
-    assert.equal(await readFile(file, "utf8"), "user change\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("bash auditing lets the active agent claim a changed preexisting file", { skip: "Retired in 1.0: no file claims" }, async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "already-dirty.txt");
-  try {
-    const original = Buffer.from("user change\n");
-    await writeFile(file, "agent update\n");
-    const registry = { owners: { [file]: "preexisting" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, []);
-    assert.equal(registry.owners[file], "workflow:test-agent");
-    assert.equal(await readFile(file, "utf8"), "agent update\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("bash auditing still restores files owned by another agent", { skip: "Retired in 1.0: no shell restore" }, async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-guard-audit-"));
-  const file = path.join(dir, "foreign.txt");
-  try {
-    const original = Buffer.from("other agent's work\n");
-    await writeFile(file, "unauthorized update\n");
-    const registry = { owners: { [file]: "workflow:other-agent" }, roots: [dir] };
-    const violations = await childGuardModule.auditProtectedMutations(
-      registry,
-      new Map([[file, original]]),
-      "workflow:test-agent",
-    );
-    assert.deepEqual(violations, [`${file} (owned by workflow:other-agent)`]);
-    assert.equal(registry.owners[file], "workflow:other-agent");
-    assert.equal(await readFile(file, "utf8"), "other agent's work\n");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("mutation lock reclaims dead owners without disturbing live or replacement locks", { skip: "Retired in 1.0: no mutation mutex" }, () => {
-  assert.match(guard, /process\.kill\(pid, 0\)/);
-  assert.match(guard, /!processIsAlive\(owner\.pid\)/);
-  assert.match(guard, /owner\?\.token !== token/);
-  assert.match(guard, /return async \(\) => \{ await removeOwnedMutex\(token\); \}/);
-  assert.match(guard, /await fs\.promises\.link\(temp, mutexPath\)/);
-});
-
-test("mutation lock waiting is bounded and abortable", { skip: "Retired in 1.0: no mutation mutex" }, () => {
-  assert.match(guard, /PI_SUBAGENT_MUTEX_WAIT_MS/);
-  assert.match(guard, /Timed out after.*waiting for the mutation lock/);
-  assert.match(guard, /signal\?\.addEventListener\("abort"/);
-  assert.match(guard, /Aborted while waiting for the mutation lock/);
-});
-
-test("mutex ownership is atomically published and contention is abortable", { skip: "Retired in 1.0: no mutation mutex" }, async () => {
-  const coord = await mkdtemp(path.join(os.tmpdir(), "pi-mutex-test-"));
-  process.env.PI_SUBAGENT_ID = "test-agent";
-  process.env.PI_SUBAGENT_COORD_DIR = coord;
-  process.env.PI_SUBAGENT_MUTEX_WAIT_MS = "2000";
-  const mutex = path.join(coord, "mutation.mutex");
-  try {
-    const { acquireMutationLock } = await import(`../child-guard.ts?test=${Date.now()}`);
-    const release = await acquireMutationLock();
-    const owner = JSON.parse(await readFile(mutex, "utf8"));
-    assert.equal(owner.pid, process.pid);
-    const controller = new AbortController();
-    const blocked = acquireMutationLock(controller.signal);
-    controller.abort();
-    await assert.rejects(blocked, /Aborted while waiting/);
-    await release();
-    await assert.rejects(stat(mutex), { code: "ENOENT" });
-  } finally {
-    await rm(coord, { recursive: true, force: true });
-    delete process.env.PI_SUBAGENT_ID;
-    delete process.env.PI_SUBAGENT_COORD_DIR;
-    delete process.env.PI_SUBAGENT_MUTEX_WAIT_MS;
   }
 });
 
