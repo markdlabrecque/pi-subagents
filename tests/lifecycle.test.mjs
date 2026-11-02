@@ -139,6 +139,81 @@ test("max-token resolution honors per-call, resumed, and profile precedence", ()
   assert.equal(clampMaxTokens(0, 32768), undefined);
 });
 
+test("tool schemas preserve scope, thinking, and maxTokens validation", async () => {
+  const { Check } = await import(piRequire.resolve("typebox/value"));
+  const tools = new Map();
+  subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+  const params = tools.get("subagent").parameters;
+  const profiles = tools.get("list_agent_profiles").parameters;
+  for (const scope of ["user", "project", "both"]) {
+    assert.equal(Check(params, { agentScope: scope }), true);
+    assert.equal(Check(profiles, { agentScope: scope }), true);
+  }
+  for (const scope of ["invalid", 1, null, {}]) {
+    assert.equal(Check(params, { agentScope: scope }), false);
+    assert.equal(Check(profiles, { agentScope: scope }), false);
+  }
+  assert.equal(Check(params, {}), true);
+  assert.equal(Check(profiles, {}), true);
+  assert.equal(params.properties.agentScope.default, "user");
+  assert.equal(profiles.properties.agentScope.default, "user");
+  for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max", "invalid", 1, null]) {
+    const valid = typeof thinking === "string" && thinking !== "invalid";
+    assert.equal(Check(params, { thinking }), valid);
+    for (const mode of ["tasks", "chain"]) {
+      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", thinking }] }), valid);
+    }
+  }
+  for (const maxTokens of [1, 4096, 0, -1, 1.5, "4096", null]) {
+    const valid = Number.isInteger(maxTokens) && maxTokens > 0;
+    assert.equal(Check(params, { maxTokens }), valid);
+    for (const mode of ["tasks", "chain"]) {
+      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", maxTokens }] }), valid);
+    }
+  }
+  for (const schema of [params.properties.agentScope, params.properties.thinking, params.properties.action, params.properties.lifecycle]) {
+    assert.equal(schema.type, "string");
+    assert.ok(Array.isArray(schema.enum), "retain provider-compatible string enums");
+  }
+});
+
+test("profile listing and management return complete tool results", async t => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-tool-results-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const tools = new Map();
+  subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+  const ctx = { cwd, hasUI: false };
+  const listed = await tools.get("list_agent_profiles").execute("profiles", { agentScope: "project" }, undefined, undefined, ctx);
+  assert.ok(Object.hasOwn(listed, "details"), "Pi requires a details field even without structured data");
+  assert.deepEqual(listed.content, [{ type: "text", text: "No agent profiles found.\nProject agents directory: none" }]);
+  const closed = await tools.get("subagent").execute("close", { action: "closeWorkflow", workflowId: "issue-6-nonexistent" }, undefined, undefined, ctx);
+  assert.equal(closed.content[0].type, "text");
+  assert.equal(closed.details.mode, "management");
+});
+
+test("profile maxTokens handles absent and invalid numeric values", async t => {
+  const agentDir = await mkdtemp(path.join(os.tmpdir(), "pi-profile-token-boundaries-"));
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  t.after(async () => {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  });
+  await mkdir(path.join(agentDir, "agents"));
+  const cases = [undefined, "0", "-1", "1.5", "NaN", "Infinity", "9007199254740992", "1", "4096"];
+  for (const [i, value] of cases.entries()) {
+    await writeFile(path.join(agentDir, "agents", `${i}.md`), `---\nname: case-${i}\ndescription: boundary test\n${value === undefined ? "" : `maxTokens: ${value}\n`}---\nwork`);
+  }
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const { discoverAgents } = await jiti.import(path.join(root, "agents.ts"));
+  const profiles = discoverAgents(agentDir, "user").agents;
+  for (const [i, value] of cases.entries()) {
+    const profile = profiles.find(profile => profile.name === `case-${i}`);
+    assert.ok(profile);
+    assert.equal(profile.maxTokens, value === "1" ? 1 : value === "4096" ? 4096 : undefined);
+  }
+});
+
 test("profile maxTokens accepts only positive integers", async () => {
   const agentDir = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-agent-profile-"));
   const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
