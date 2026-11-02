@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -104,17 +103,17 @@ const TaskSchema = Type.Object({
   task: Type.String({ description: "Specific delegated instruction" }),
   cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the parent cwd" })),
   model: Type.Optional(Type.String({ description: "Optional model override" })),
-  thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking-level override" })),
+  thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
 });
 const Params = Type.Object({
-  action: Type.Optional(StringEnum(["run", "list", "cancel", "closeAgent", "closeWorkflow"] as const, { default: "run" })),
-  lifecycle: Type.Optional(StringEnum(["terminal", "workflow"] as const, { default: "terminal" })),
+  action: Type.Optional(Type.Enum(["run", "list", "cancel", "closeAgent", "closeWorkflow"] as const, { type: "string", default: "run" })),
+  lifecycle: Type.Optional(Type.Enum(["terminal", "workflow"] as const, { type: "string", default: "terminal" })),
   workflowId: Type.Optional(Type.String({ description: "Stable workflow identifier for workflow lifecycle" })),
   agentId: Type.Optional(Type.String({ description: "Stable role identifier for workflow lifecycle" })),
   agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
   model: Type.Optional(Type.String({ description: "Optional model override for single mode" })),
-  thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking-level override for single mode" })),
+  thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
   background: Type.Optional(Type.Boolean({ description: "Return immediately and deliver the result later as one follow-up message; works for single, tasks, and chain" })),
   jobId: Type.Optional(Type.String({ description: "Background job id for action cancel" })),
@@ -123,7 +122,7 @@ const Params = Type.Object({
   workflowMaxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Internal workflow role output-token limit" })),
   tasks: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
   chain: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
-  agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user" })),
+  agentScope: Type.Optional(Type.Enum(["user", "project", "both"] as const, { type: "string", default: "user" })),
   confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
   timeoutMinutes: Type.Optional(Type.Number({ minimum: 1, default: 30 })),
 });
@@ -400,7 +399,7 @@ export default function (pi: ExtensionAPI) {
       const failed = results.filter(r => r.status !== "done");
       if (!workflowLifecycle && !failed.length) await fs.promises.rm(runDir, { recursive: true, force: true });
       const summaries = results.map(r => `### ${r.agent} — ${r.status}\n${r.status === "done" ? r.output || "(no output)" : `Reason: ${r.reason || "unknown failure"}\nSession: ${r.sessionDir}`}`);
-        return { content: [{ type: "text", text: `${results.length - failed.length}/${results.length} subagents completed\n\n${summaries.join("\n\n---\n\n")}` }], details: { mode: workflowLifecycle ? "workflow" : params.chain?.length ? "chain" : params.tasks?.length ? "parallel" : "single", results } as Details };
+        return { content: [{ type: "text" as const, text: `${results.length - failed.length}/${results.length} subagents completed\n\n${summaries.join("\n\n---\n\n")}` }], details: { mode: workflowLifecycle ? "workflow" : params.chain?.length ? "chain" : params.tasks?.length ? "parallel" : "single", results } as Details };
       } catch (error: any) {
         if (workflowLifecycle) await mutateWorkflow(params.workflowId!, async () => {
           const workflow = await readWorkflow(params.workflowId!); const record = workflow?.agents[params.agentId!];
@@ -480,7 +479,7 @@ export default function (pi: ExtensionAPI) {
     description: "List agent profiles currently discoverable by the subagent extension, including their source, description, model, thinking level, and tool restrictions.",
     promptSnippet: "List profiles available to the subagent tool",
     parameters: Type.Object({
-      agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user", description: "Which profile locations to include" })),
+      agentScope: Type.Optional(Type.Enum(["user", "project", "both"] as const, { type: "string", default: "user", description: "Which profile locations to include" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const scope: AgentScope = params.agentScope ?? "user";
@@ -493,7 +492,7 @@ export default function (pi: ExtensionAPI) {
           ].join("\n")).join("\n")
         : "No agent profiles found.";
       const location = scope === "project" || scope === "both" ? `\nProject agents directory: ${projectAgentsDir ?? "none"}` : "";
-      return { content: [{ type: "text", text: `${text}${location}` }] };
+      return { content: [{ type: "text", text: `${text}${location}` }], details: undefined };
     },
   });
 

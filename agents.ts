@@ -67,7 +67,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 		const parsedMaxTokens = frontmatter.maxTokens === undefined ? undefined : Number(frontmatter.maxTokens);
-		const maxTokens = Number.isSafeInteger(parsedMaxTokens) && parsedMaxTokens > 0 ? parsedMaxTokens : undefined;
+		const maxTokens = parsedMaxTokens !== undefined && Number.isSafeInteger(parsedMaxTokens) && parsedMaxTokens > 0 ? parsedMaxTokens : undefined;
 
 		agents.push({
 			name: frontmatter.name,
