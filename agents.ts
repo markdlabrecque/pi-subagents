@@ -85,41 +85,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 	return agents;
 }
 
-function loadAgentsFromProviders(): AgentConfig[] {
-	const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-subagents.agent-providers")];
-	if (!(registry instanceof Map)) return [];
-
-	const agents: AgentConfig[] = [];
-	for (const provider of registry.values()) {
-		if (typeof provider !== "function") continue;
-		let entries: unknown;
-		try {
-			entries = provider();
-		} catch {
-			continue;
-		}
-		if (!Array.isArray(entries)) continue;
-		for (const entry of entries) {
-			try {
-				if (!entry || typeof entry !== "object") continue;
-				const { name, description, tools, model, thinking, maxTokens, systemPrompt, source, filePath } = entry;
-				if (typeof name !== "string" || !name.trim() ||
-					typeof description !== "string" || !description.trim() ||
-					typeof systemPrompt !== "string" || typeof filePath !== "string" || !filePath.trim() ||
-					source !== "user") continue;
-				if (tools !== undefined && (!Array.isArray(tools) || !tools.every(t => typeof t === "string"))) continue;
-				if (model !== undefined && typeof model !== "string") continue;
-				if (thinking !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) continue;
-				if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || maxTokens <= 0)) continue;
-				agents.push({ name, description, tools, model, thinking, maxTokens, systemPrompt, source, filePath });
-			} catch {
-				// A malformed entry must not hide other profiles from this provider.
-			}
-		}
-	}
-	return agents;
-}
-
 function isDirectory(p: string): boolean {
 	try {
 		return fs.statSync(p).isDirectory();
@@ -140,12 +105,64 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
+/**
+ * Other extensions offer agent profiles without writing files: they register
+ * a provider in this global map (shared by every extension in the process,
+ * whatever its module root), keyed by their own name:
+ *
+ *   const key = Symbol.for("pi-subagents.agent-providers");
+ *   (globalThis[key] ??= new Map()).set("my-extension", () => [{ name, description, tools?, model?, thinking?, maxTokens?, systemPrompt, filePath }]);
+ *
+ * Providers are called on every discovery and count as user-scope profiles.
+ * A profile in ~/.pi/agent/agents with the same name wins.
+ */
+export const AGENT_PROVIDERS = Symbol.for("pi-subagents.agent-providers");
+
+const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function loadProvidedAgents(): AgentConfig[] {
+	const providers = (globalThis as Record<symbol, unknown>)[AGENT_PROVIDERS];
+	if (!(providers instanceof Map)) return [];
+	const agents: AgentConfig[] = [];
+	for (const [owner, provide] of providers) {
+		let list: unknown;
+		try {
+			list = typeof provide === "function" ? provide() : undefined;
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(list)) continue;
+		for (const a of list) try {
+			if (!a || typeof a !== "object") continue;
+			const { name, description, tools, model, thinking, systemPrompt, source, filePath } = a;
+			if (typeof name !== "string" || !name.trim() || typeof description !== "string" || !description.trim()) continue;
+			if (typeof systemPrompt !== "string" || (filePath !== undefined && (typeof filePath !== "string" || !filePath.trim())) || (source !== undefined && source !== "user")) continue;
+			if (tools !== undefined && (!Array.isArray(tools) || !tools.every(t => typeof t === "string"))) continue;
+			if (model !== undefined && typeof model !== "string") continue;
+			if (thinking !== undefined && !THINKING.includes(thinking)) continue;
+			if (a.maxTokens !== undefined && (!Number.isSafeInteger(a.maxTokens) || a.maxTokens <= 0)) continue;
+			const maxTokens = a.maxTokens;
+			agents.push({
+				name: a.name,
+				description: a.description,
+				tools: Array.isArray(a.tools) && a.tools.length > 0 ? a.tools.map(String) : undefined,
+				model: typeof a.model === "string" ? a.model : undefined,
+				thinking: a.thinking,
+				maxTokens,
+				systemPrompt: a.systemPrompt,
+				source: "user",
+				filePath: typeof a.filePath === "string" ? a.filePath : `provider:${owner}`,
+			});
+		} catch { continue; }
+	}
+	return agents;
+}
+
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
-	// Explicit user files override providers; project files still override both.
-	const userAgents = scope === "project" ? [] : [...loadAgentsFromProviders(), ...loadAgentsFromDir(userDir, "user")];
+	const userAgents = scope === "project" ? [] : [...loadProvidedAgents(), ...loadAgentsFromDir(userDir, "user")];
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();

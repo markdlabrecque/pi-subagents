@@ -8,7 +8,6 @@ export interface AgentCard {
   currentTool?: string;
   currentToolElapsed?: string;
   contextTokens: number;
-  lockCount: number;
 }
 
 export interface CardStyle {
@@ -40,7 +39,7 @@ function cardLines(card: AgentCard, width: number, style: CardStyle): string[] {
     : "↳ thinking...";
   const toolLines = wrapTextWithAnsi(tool, inner).slice(0, 2);
   content.push(...toolLines.map(line => fit(style.accent(line), inner)));
-  content.push(fit(style.muted(`ctx ${card.contextTokens.toLocaleString()} · ${card.lockCount} locks`), inner));
+  content.push(fit(style.muted(`ctx ${card.contextTokens.toLocaleString()}`), inner));
   const horizontal = style.border("─".repeat(inner));
   return [
     `${style.border("┌")}${horizontal}${style.border("┐")}`,
