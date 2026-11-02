@@ -8,6 +8,7 @@ import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext 
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
+import { createHerdrStatus } from "./herdr-status.ts";
 import { renderAgentGrid, type AgentCard } from "./widget-layout.ts";
 
 const MAX_TASKS = 8;
@@ -188,6 +189,7 @@ export default function (pi: ExtensionAPI) {
   const closingWorkflowRequests = new Map<string, Promise<string>>();
   const backgroundJobs = new Map<string, { controller: AbortController; agent: string; task: string; startedAt: number; cancelled: boolean }>();
   let backgroundSeq = 0; let shuttingDown = false;
+  const herdr = createHerdrStatus(pi);
   let widgetCtx: ExtensionContext | undefined;
   const updateWidget = () => {
     if (!widgetCtx?.hasUI) return;
@@ -493,11 +495,13 @@ export default function (pi: ExtensionAPI) {
     const jobId = `bg-${++backgroundSeq}`;
     const job = { controller: new AbortController(), agent, task: specs[0].task, startedAt: Date.now(), cancelled: false };
     backgroundJobs.set(jobId, job);
+    herdr.start(jobId);
     void runSubagent({ ...params, background: undefined }, job.controller.signal, undefined, ctx).then(
       result => result.content.map(c => c.text).join("\n"),
       (error: any) => `Background subagent failed: ${error?.message ?? String(error)}`,
     ).then(text => {
       backgroundJobs.delete(jobId);
+      herdr.end(jobId);
       if (shuttingDown) return;
       pi.sendMessage({ customType: "subagent-background-result", display: true, content: `[${jobId}] ${job.agent} ${job.cancelled ? "cancelled" : "finished"}\n\n${text}`, details: { jobId, agent: job.agent } },
         { triggerTurn: !job.cancelled, deliverAs: "followUp" });
