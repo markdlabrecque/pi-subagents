@@ -42,12 +42,11 @@ export function normalizeMaxTokens(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
-/** Per-call wins; resumed workflow settings remain stable ahead of profile/role defaults. */
-export function resolveMaxTokens(input: { perCall?: unknown; existing?: unknown; profile?: unknown; workflowRole?: unknown }): number | undefined {
+/** Per-call wins; resumed workflow settings remain stable ahead of profile defaults. */
+export function resolveMaxTokens(input: { perCall?: unknown; existing?: unknown; profile?: unknown }): number | undefined {
   return normalizeMaxTokens(input.perCall)
     ?? normalizeMaxTokens(input.existing)
-    ?? normalizeMaxTokens(input.profile)
-    ?? normalizeMaxTokens(input.workflowRole);
+    ?? normalizeMaxTokens(input.profile);
 }
 
 export function clampMaxTokens(maxTokens: unknown, modelMaxTokens: unknown): number | undefined {
@@ -82,9 +81,6 @@ interface WorkflowAgentRecord {
   activeRunMs?: number; idleWaitingMs?: number; lastEndedAt?: string;
 }
 interface WorkflowRecord { workflowId: string; runDir: string; agents: Record<string, WorkflowAgentRecord>; createdAt: string; updatedAt: string; }
-interface CloseWorkflowRequest {
-  action: "closeWorkflow"; workflowId: string; accept: () => void; resolve: (text: string) => void; reject: (error: unknown) => void;
-}
 const safeId = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_");
 const workflowDir = (workflowId: string) => path.join(WORKFLOW_ROOT, safeId(workflowId));
 const workflowRecordPath = (workflowId: string) => path.join(workflowDir(workflowId), "workflow.json");
@@ -121,8 +117,6 @@ const Params = Type.Object({
   thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
   freshSession: Type.Optional(Type.Boolean({ description: "Start a fresh workflow child context instead of resuming its prior session" })),
-  // Set only by development-workflow from its persisted role configuration.
-  workflowMaxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Internal workflow role output-token limit" })),
   tasks: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
   chain: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
   agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user" })),
@@ -272,11 +266,27 @@ export default function (pi: ExtensionAPI) {
     void closing.then(() => closingWorkflowRequests.delete(workflowId), () => closingWorkflowRequests.delete(workflowId));
     return closing;
   };
-  pi.events.on("subagent:request", (data: unknown) => {
-    const request = data as Partial<CloseWorkflowRequest>;
-    if (request.action !== "closeWorkflow" || typeof request.workflowId !== "string" || typeof request.accept !== "function" || typeof request.resolve !== "function" || typeof request.reject !== "function") return;
-    request.accept();
-    void closeWorkflow(request.workflowId).then(request.resolve, request.reject);
+
+  pi.registerTool({
+    name: "list_agent_profiles", label: "Agent profiles",
+    description: "List agent profiles currently discoverable by the subagent extension, including their source, description, model, thinking level, and tool restrictions.",
+    promptSnippet: "List profiles available to the subagent tool",
+    parameters: Type.Object({
+      agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user", description: "Which profile locations to include" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const scope: AgentScope = params.agentScope ?? "user";
+      const { agents, projectAgentsDir } = discoverAgents(ctx.cwd, scope);
+      const text = agents.length
+        ? agents.map(agent => [
+            `${agent.name} (${agent.source}) — ${agent.description}`,
+            `  model: ${agent.model ?? "inherited"}; thinking: ${agent.thinking ?? "inherited"}`,
+            `  tools: ${agent.tools?.join(", ") ?? "default"}`,
+          ].join("\n")).join("\n")
+        : "No agent profiles found.";
+      const location = scope === "project" || scope === "both" ? `\nProject agents directory: ${projectAgentsDir ?? "none"}` : "";
+      return { content: [{ type: "text", text: `${text}${location}` }] };
+    },
   });
 
   pi.registerTool({
@@ -405,7 +415,7 @@ export default function (pi: ExtensionAPI) {
             const now = new Date().toISOString();
             workflow ??= { workflowId: params.workflowId!, runDir, agents: {}, createdAt: now, updatedAt: now };
             const selectedModel = spec.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-            const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens, workflowRole: params.workflowMaxTokens }), modelMaxTokens(ctx, selectedModel));
+            const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens }), modelMaxTokens(ctx, selectedModel));
             const idleWaitingMs = (existing?.idleWaitingMs ?? 0) + (existing?.lastEndedAt ? Math.max(0, Date.now() - Date.parse(existing.lastEndedAt)) : 0);
             workflow.agents[params.agentId!] = { workflowId: params.workflowId!, agentId: params.agentId!, profile: agent.name, sessionDir,
               sessionFile: params.freshSession ? undefined : existing?.sessionFile, status: "running", model: spec.model ?? agent.model, thinking: spec.thinking ?? agent.thinking ?? pi.getThinkingLevel(), maxTokens,
@@ -421,7 +431,7 @@ export default function (pi: ExtensionAPI) {
         if (!params.freshSession && existing?.sessionFile && fs.existsSync(existing.sessionFile)) args.push("--session", existing.sessionFile);
         args.push("--name", `subagent:${agent.name}:${id}`, "--extension", CHILD_GUARD, "--exclude-tools", "subagent", "--append-system-prompt", promptFile);
         const selectedModel = spec.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-        const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens, workflowRole: params.workflowMaxTokens }), modelMaxTokens(ctx, selectedModel));
+        const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens }), modelMaxTokens(ctx, selectedModel));
         const selectedThinking = spec.thinking ?? agent.thinking ?? pi.getThinkingLevel(); state.modelUsed = selectedModel; state.thinkingUsed = selectedThinking; state.maxTokens = maxTokens;
         if (maxTokens !== undefined) args.push("--extension", MAX_TOKENS_OVERRIDE);
         if (selectedModel) args.push("--model", selectedModel);

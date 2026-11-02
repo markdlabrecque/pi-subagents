@@ -29,7 +29,9 @@ Parallel mode is used only when the parent explicitly supplies `tasks`. Limits a
 
 ## Agent profiles
 
-Profiles live in `~/.pi/agent/agents/*.md`. Project profiles in `.pi/agents/*.md` are disabled by default and require `agentScope: "project"` or `"both"`; interactive runs ask for confirmation.
+Use the `list_agent_profiles` tool to see profiles currently discoverable by the extension, including their source and configuration. It accepts `agentScope: "user"` (default), `"project"`, or `"both"`; project-local profiles are listed but are still subject to confirmation when launched.
+
+Profiles live in `~/.pi/agent/agents/*.md`.  Project profiles in `.pi/agents/*.md` are disabled by default and require `agentScope: "project"` or `"both"`; interactive runs ask for confirmation.
 
 ```markdown
 ---
@@ -44,11 +46,7 @@ maxTokens: 16384
 Agent-specific system instructions.
 ```
 
-Omit `model` to inherit the parent's selected model. Thinking resolution is per-call override, then profile `thinking`, then parent level. Development-workflow injects its validated persisted role thinking as the per-call value only for workflow-lifecycle dispatches when the caller did not explicitly provide `thinking`; this happens again on resumed jobs. Terminal calls are unchanged. `maxTokens` is an optional positive-integer output limit. Its resolution is per-call override, then a persisted workflow-agent limit on resume, then profile `maxTokens`, then the development-workflow role limit. Invalid values are ignored; effective limits are clamped to the selected model's configured `maxTokens`. Terminal calls without a per-call/profile limit do not receive a token override. Supported profile thinking values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; invalid thinking profiles are ignored. A tool-call `model` override has highest priority. Tool allowlists are configured per profile; omitting `tools` uses Pi's default active tools except `subagent`.
-
-### Profiles versus development-workflow roles
-
-A profile selects a prompt and tools; it does not create a development-workflow authority role. Development-workflow lifecycle calls accept only exact `agentId` values `planner`, `implementer`, `test-writer`, `reviewer`, and `reporter`. Spelling variants such as `test_writer` and semantic aliases such as `auditor` are not normalized or inferred.
+Omit `model` to inherit the parent's selected model. Thinking resolution is per-call override, then profile `thinking`, then parent level. `maxTokens` is an optional positive-integer output limit. Its resolution is per-call override, then a persisted workflow-agent limit on resume, then profile `maxTokens`. Invalid values are ignored; effective limits are clamped to the selected model's configured `maxTokens`. Calls without a per-call/profile limit do not receive a token override. Supported profile thinking values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; invalid thinking profiles are ignored. A tool-call `model` override has highest priority. Tool allowlists are configured per profile; omitting `tools` uses Pi's default active tools except `subagent`.
 
 Use auxiliary profiles through an ordinary terminal dispatch instead:
 
@@ -65,7 +63,7 @@ Omit `lifecycle`, `workflowId`, and `agentId`; never invent a workflow role for 
 - Each child gets its own persisted session directory while running.
 - Successful terminal run directories and sessions are deleted after all tasks finish.
 - Failed run directories remain under the system temporary directory for 24 hours, and their paths are returned to the parent.
-- `closeWorkflow` is the single cleanup action used by both the `subagent` tool and trusted inter-extension requests. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first registry write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
+- `closeWorkflow` is the single cleanup action used by the `subagent` tool. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first registry write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
 - `closeAgent` likewise waits for a running child, clears its active-widget entry, removes successful sessions, and retains aborted/failed agent diagnostics for 24 hours.
 - A workflow agent rejects a concurrent run for the same stable `(workflowId, agentId)`. Workflow registry and ownership-registry updates are serialized across agents in the same workflow.
 - Chains stop at the first failed child.

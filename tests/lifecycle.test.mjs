@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -7,13 +8,18 @@ import path from "node:path";
 import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
-const developmentRoot = path.resolve(root, "..", "development-workflow");
 const index = await readFile(path.join(root, "index.ts"), "utf8");
-const development = await readFile(path.join(developmentRoot, "index.ts"), "utf8");
 const guard = await readFile(path.join(root, "child-guard.ts"), "utf8");
 const widgetLayout = await readFile(path.join(root, "widget-layout.ts"), "utf8");
-const globalNodeModules = spawnSync("npm", ["root", "-g"], { encoding: "utf8" }).stdout.trim();
-const piRoot = path.join(globalNodeModules, "@earendil-works", "pi-coding-agent");
+const piCommand = spawnSync("sh", ["-lc", "command -v pi"], { encoding: "utf8" }).stdout.trim();
+if (!piCommand) throw new Error("Cannot locate the active Pi executable on PATH");
+let piRoot = path.dirname(realpathSync(piCommand));
+while (piRoot !== path.dirname(piRoot)) {
+  const manifest = path.join(piRoot, "package.json");
+  if (existsSync(manifest) && JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") break;
+  piRoot = path.dirname(piRoot);
+}
+if (piRoot === path.dirname(piRoot)) throw new Error(`Cannot locate Pi package root from ${piCommand}`);
 const piRequire = createRequire(path.join(piRoot, "package.json"));
 const createJiti = piRequire("jiti");
 const nodeModules = path.join(piRoot, "node_modules");
@@ -54,12 +60,11 @@ test("workflow owner and session handles are stable", () => {
   assert.match(index, /PI_SUBAGENT_ID: id/);
 });
 
-test("max-token resolution honors per-call, resumed, profile, and workflow-role precedence", () => {
+test("max-token resolution honors per-call, resumed, and profile precedence", () => {
   const { resolveMaxTokens, clampMaxTokens } = subagentModule;
-  assert.equal(resolveMaxTokens({ perCall: 1024, existing: 2048, profile: 4096, workflowRole: 8192 }), 1024, "per-call wins");
-  assert.equal(resolveMaxTokens({ existing: 2048, profile: 4096, workflowRole: 8192 }), 2048, "resumed workflow agent keeps its prior limit");
-  assert.equal(resolveMaxTokens({ profile: 4096, workflowRole: 8192 }), 4096, "profile overrides workflow role default");
-  assert.equal(resolveMaxTokens({ workflowRole: 8192 }), 8192, "workflow role supplies the final default");
+  assert.equal(resolveMaxTokens({ perCall: 1024, existing: 2048, profile: 4096 }), 1024, "per-call wins");
+  assert.equal(resolveMaxTokens({ existing: 2048, profile: 4096 }), 2048, "resumed workflow agent keeps its prior limit");
+  assert.equal(resolveMaxTokens({ profile: 4096 }), 4096, "profile supplies the final default");
   assert.equal(resolveMaxTokens({ perCall: -1, profile: 4096 }), 4096, "invalid override is ignored");
   assert.equal(clampMaxTokens(65536, 32768), 32768, "limit never exceeds selected model maximum");
   assert.equal(clampMaxTokens(4096, undefined), 4096);
@@ -85,6 +90,103 @@ test("profile maxTokens accepts only positive integers", async () => {
   }
 });
 
+const agentProviders = Symbol.for("pi-subagents.agent-providers");
+
+async function withAgentDiscovery(run) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-discovery-"));
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const priorRegistry = Object.getOwnPropertyDescriptor(globalThis, agentProviders);
+  try {
+    const userDir = path.join(dir, "user");
+    const cwd = path.join(dir, "project");
+    await mkdir(path.join(userDir, "agents"), { recursive: true });
+    await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = userDir;
+    globalThis[agentProviders] = new Map();
+    const { discoverAgents } = await jiti.import(path.join(root, "agents.ts"));
+    const profile = (name, overrides = {}) => ({
+      name, description: "provider profile", systemPrompt: "Stage instructions.",
+      source: "user", filePath: `/provider/${name}.md`, ...overrides,
+    });
+    const writeProfile = (source, name) => writeFile(
+      path.join(source === "user" ? userDir : path.join(cwd, ".pi"), "agents", `${name}.md`),
+      `---\nname: ${name}\ndescription: ${source} file profile\n---\n${source} instructions.`,
+    );
+    await run({ discover: scope => discoverAgents(cwd, scope), profile, writeProfile });
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    if (priorRegistry) Object.defineProperty(globalThis, agentProviders, priorRegistry);
+    else delete globalThis[agentProviders];
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("provider discovery includes live user profiles in user and both scopes", async () => {
+  await withAgentDiscovery(async ({ discover, profile }) => {
+    assert.deepEqual(discover("user").agents, []);
+    const agent = profile("orchestration:test-writer", { tools: ["read", "edit"], model: "provider/model", thinking: "high", maxTokens: 4096 });
+    let calls = 0;
+    globalThis[agentProviders].set("orchestration", () => { calls++; return [agent]; });
+    for (const scope of ["user", "both"]) assert.deepEqual(discover(scope).agents, [agent]);
+    agent.systemPrompt = "Updated instructions.";
+    assert.equal(discover("user").agents[0].systemPrompt, "Updated instructions.");
+    assert.equal(calls, 3, "providers are evaluated on each discovery, not cached");
+  });
+});
+
+test("file profiles retain user and project precedence over provider profiles", async () => {
+  await withAgentDiscovery(async ({ discover, profile, writeProfile }) => {
+    globalThis[agentProviders].set("stages", () => [profile("shared"), profile("provider-only")]);
+    await writeProfile("user", "shared");
+    await writeProfile("project", "shared");
+    assert.equal(discover("user").agents.find(a => a.name === "shared").description, "user file profile");
+    const both = discover("both").agents;
+    assert.equal(both.find(a => a.name === "shared").source, "project");
+    assert.equal(both.find(a => a.name === "shared").description, "project file profile");
+    assert.equal(both.filter(a => a.name === "shared").length, 1);
+    assert.equal(both.find(a => a.name === "provider-only").source, "user");
+  });
+});
+
+test("project-only discovery never invokes user providers", async () => {
+  await withAgentDiscovery(async ({ discover, writeProfile }) => {
+    let calls = 0;
+    globalThis[agentProviders].set("stages", () => { calls++; throw new Error("must not run"); });
+    await writeProfile("user", "user-only");
+    await writeProfile("project", "project-only");
+    const result = discover("project");
+    assert.deepEqual(result.agents.map(a => a.name), ["project-only"]);
+    assert.ok(result.projectAgentsDir.endsWith(path.join(".pi", "agents")));
+    assert.equal(calls, 0);
+  });
+});
+
+test("provider discovery isolates failures and rejects malformed entries", async () => {
+  await withAgentDiscovery(async ({ discover, profile, writeProfile }) => {
+    await writeProfile("user", "file-only");
+    for (const registry of [undefined, {}, []]) {
+      globalThis[agentProviders] = registry;
+      assert.deepEqual(discover("user").agents.map(a => a.name), ["file-only"]);
+    }
+    const throwingEntry = Object.defineProperty({}, "name", { get() { throw new Error("bad getter"); } });
+    globalThis[agentProviders] = new Map([
+      ["throws", () => { throw new Error("provider failed"); }],
+      ["not-callable", 42],
+      ["not-array", () => ({})],
+      ["malformed", () => [null, 42, {}, throwingEntry,
+        ...[ { name: "" }, { description: 42 }, { systemPrompt: null }, { filePath: null },
+          { source: "project" }, { tools: "read" }, { tools: [42] }, { model: 42 },
+          { thinking: "invalid" }, { maxTokens: -1 }, { maxTokens: 1.5 },
+        ].map(overrides => profile("invalid", overrides)),
+        profile("valid-after-invalid"),
+      ]],
+      ["healthy", () => [profile("healthy")]],
+    ]);
+    assert.deepEqual(discover("user").agents.map(a => a.name).sort(), ["file-only", "healthy", "valid-after-invalid"]);
+  });
+});
+
 test("child max-token override clamps runtime models and terminal calls stay unchanged without a limit", () => {
   const model = { maxTokens: 32768 };
   assert.equal(maxTokensOverride.applyMaxTokens(model, 65536), 32768);
@@ -104,7 +206,6 @@ test("cleanup and failure retention are explicit", () => {
   assert.match(index, /await Promise\.all\(exits\)/);
   assert.match(index, /filter\(a => a\.status === "done"\).*fs\.promises\.rm/s);
   assert.match(index, /await fs\.promises\.utimes\(retained, new Date\(\), new Date\(\)\)/);
-  assert.match(index, /pi\.events\.on\("subagent:request"/);
   assert.match(index, /const text = await closeWorkflow\(params\.workflowId\)/);
   assert.match(index, /workflowRuns\.has\(workflowRunId\)/);
   assert.match(index, /closingWorkflowRequests\.get\(workflowId\)/);
@@ -113,53 +214,6 @@ test("cleanup and failure retention are explicit", () => {
   assert.match(index, /await Promise\.all\(\[exit, run\]/);
   assert.match(index, /failed-\$\{Date\.now\(\)\}-\$\{safeId\(params\.workflowId!\)\}-\$\{safeId\(params\.agentId!\)\}/);
   assert.match(index, /await mutateWorkflow\(params\.workflowId!/);
-});
-
-test("development workflow has no widget or subagent widget telemetry", () => {
-  assert.doesNotMatch(development, /setWidget\("development-workflow"/);
-  assert.doesNotMatch(development, /development-workflow:agent/);
-  assert.doesNotMatch(index, /development-workflow:agent/);
-  assert.match(index, /setWidget\("subagents", \(_tui, theme\) =>/);
-});
-
-test("workflow mode is process-local rather than session-file handed off", async () => {
-  const threadMode = await readFile(path.join(developmentRoot, "thread-mode.ts"), "utf8");
-  assert.match(threadMode, /Symbol\.for\("development-workflow\.enabled\.v2"\)/);
-  assert.match(threadMode, /LEGACY_WORKFLOW_MODE_KEY/);
-  assert.match(threadMode, /return root\[WORKFLOW_MODE_KEY\] \?\?= false/);
-  assert.match(development, /workflowModeEnabled\(\)/);
-  assert.doesNotMatch(development, /WeakMap|pendingReplacement|SessionManager\.open|pi\.appendEntry|previousSessionFile|THREAD_MODE_ENTRY/);
-  assert.match(development, /const workflowActive = \(\): boolean => workflowModeEnabled\(\) \|\| foregroundActivated \|\| pendingForegroundActivation \|\| preflightForegroundActivation \|\| isWorkflowChildSession\(\)/);
-  assert.match(development, /pi\.setActiveTools\(workflowActive\(\) \? \[\.\.\.new Set\(\[\.\.\.active, "development_workflow"\]\)\] : active\.filter\(name => name !== "development_workflow"\)\)/);
-  assert.match(development, /setStatus\("development-workflow", undefined\)/);
-  assert.match(development, /hasWorkflowTrigger\(event\.text \?\? ""\)/);
-  assert.match(development, /const activeForPrompt = workflowActive\(\)/);
-  assert.match(development, /if \(!activeForPrompt\) return undefined/);
-  assert.match(development, /return \{ systemPrompt:/);
-  // Disabled foreground calls are blocked, while persistent workflow children retain
-  // access to record their own stage results.
-  assert.match(development, /pi\.on\("tool_call", async \(event, ctx\) => \{.*if \(event\.toolName === "development_workflow"\) \{/s);
-  assert.match(development, /if \(workflowActive\(\)\) return undefined/);
-  assert.match(development, /childWorkflowAccessError/);
-  assert.match(development, /if \(!workflowActive\(\)\) throw new Error\("Development workflow is inactive/);
-  for (const command of ["workflow-enable", "workflow-disable"]) assert.match(development, new RegExp(`registerCommand\\("${command}"`));
-});
-
-test("development workflow coordinates the subagent close action before state removal", () => {
-  assert.match(development, /pi\.events\.emit\("subagent:request", request\)/);
-  assert.match(development, /const text = await requestSubagentClose\(pi, state\.id\);\s+await retireState\(state\.id\);/s);
-  assert.match(development, /const MAX_TRACKED_COMPLETION_TOOL_CALLS = 256/);
-  assert.match(development, /pi\.on\("tool_result", \(event: any\) => \{.*if \(event\.toolName === "development_workflow" && event\.input\?\.action === "complete" && !event\.isError\) trackCompletionToolCall/s);
-  assert.match(development, /while \(completionToolCalls\.size >= MAX_TRACKED_COMPLETION_TOOL_CALLS\)/);
-  assert.match(development, /pi\.on\("agent_end", \(\) => \{\s+completionToolCalls\.clear\(\)/);
-  assert.match(development, /pi\.on\("session_shutdown", async event => \{.*completionToolCalls\.clear\(\)/s);
-  assert.match(development, /message\?\.role !== "toolResult" \|\| !completionToolCalls\.delete\(message\.toolCallId\)/);
-  assert.match(development, /message\.toolName !== "development_workflow".*state\?\.stage !== "completed"/s);
-  assert.match(development, /setTimeout\(\(\) => \{\s+void closeCompletedAfterForegroundResult/s);
-  assert.doesNotMatch(development, /pi\.on\("message_end", async/);
-  assert.match(development, /await retireState\(state\.id\);\s+stateCache\.delete\(state\.id\);\s+untrackWorkflowId\(state\.id\);/s);
-  assert.match(development, /void closeCompletedAfterForegroundResult\(state\.id\)/);
-  assert.doesNotMatch(development, /Also call subagent closeWorkflow/);
 });
 
 test("guard blocks cross-owner edits and restores shell mutations", () => {
@@ -323,8 +377,8 @@ test("workflow setup failures retain their original error", async () => {
 });
 
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {
-  const extensions = [path.join(root, "index.ts"), path.join(developmentRoot, "index.ts")];
-  for (const args of [extensions.flatMap(extension => ["-e", extension]), ["-e", extensions[0]], ["-e", extensions[1]]]) {
+  const extensions = [path.join(root, "index.ts")];
+  for (const args of [extensions.flatMap(extension => ["-e", extension]), ["-e", extensions[0]]]) {
     const result = spawnSync("pi", ["--list-models", ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   }
