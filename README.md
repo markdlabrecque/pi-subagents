@@ -25,6 +25,21 @@ The parent model calls `subagent` in one of these modes:
 { action: "closeWorkflow", workflowId: "workflow-123" }
 ```
 
+### Background runs
+
+Single, parallel (`tasks`), and chain calls accept `background: true`. The tool returns a job id at once, so the parent can keep working or answer the user. One job covers the whole call: cancelling it stops every child in the batch or chain, and once the last child ends, the combined result is posted to the session as a `subagent-background-result` follow-up message that wakes the parent.
+
+```ts
+{ agent: "reviewer", task: "Review ...", background: true }   // -> "Started background subagent bg-1 ..."
+{ tasks: [{ agent: "scout", task: "..." }, { agent: "reviewer", task: "..." }], background: true }   // one job, bg-2
+{ action: "list" }                                            // shows running background jobs
+{ action: "cancel", jobId: "bg-1" }                           // stops it; the cancel notice does not wake the parent
+```
+
+You can also manage them yourself without asking the agent: `/subagents` lists running jobs, `/subagents cancel` stops the only running job, and `/subagents cancel <jobId>` or `/subagents cancel all` picks which ones. Tab completes job ids.
+
+Background runs need a long-lived session (interactive or RPC). In print mode (`-p`) Pi exits when the parent finishes its turn, which kills the child. Ending the session cancels all background jobs. The main agent's own edits are not covered by the file guard, so a background child and the parent can touch the same file.
+
 Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, 30 minutes per child, and 50 KB of model-visible output per child.
 
 ## Agent profiles

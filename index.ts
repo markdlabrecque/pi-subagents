@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
 import { renderAgentGrid, type AgentCard } from "./widget-layout.ts";
 
@@ -72,7 +72,7 @@ interface ActiveTask extends TaskSpec {
   maxTokens?: number; contextTokens: number; lockCount: number; output?: string; reason?: string; sessionDir?: string;
 }
 interface RunResult extends ActiveTask { exitCode: number; usage: { input: number; output: number; cost: number; turns: number }; }
-interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: RunResult[]; workflows?: WorkflowRecord[]; }
+interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: RunResult[]; workflows?: WorkflowRecord[]; jobId?: string; }
 interface WorkflowAgentRecord {
   workflowId: string; agentId: string; profile: string; sessionDir: string; sessionFile?: string;
   status: Status; model?: string; thinking: ThinkingLevel; maxTokens?: number; cwd: string; createdAt: string; updatedAt: string;
@@ -108,7 +108,7 @@ const TaskSchema = Type.Object({
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
 });
 const Params = Type.Object({
-  action: Type.Optional(StringEnum(["run", "list", "closeAgent", "closeWorkflow"] as const, { default: "run" })),
+  action: Type.Optional(StringEnum(["run", "list", "cancel", "closeAgent", "closeWorkflow"] as const, { default: "run" })),
   lifecycle: Type.Optional(StringEnum(["terminal", "workflow"] as const, { default: "terminal" })),
   workflowId: Type.Optional(Type.String({ description: "Stable workflow identifier for workflow lifecycle" })),
   agentId: Type.Optional(Type.String({ description: "Stable role identifier for workflow lifecycle" })),
@@ -116,6 +116,8 @@ const Params = Type.Object({
   model: Type.Optional(Type.String({ description: "Optional model override for single mode" })),
   thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
+  background: Type.Optional(Type.Boolean({ description: "Return immediately and deliver the result later as one follow-up message; works for single, tasks, and chain" })),
+  jobId: Type.Optional(Type.String({ description: "Background job id for action cancel" })),
   freshSession: Type.Optional(Type.Boolean({ description: "Start a fresh workflow child context instead of resuming its prior session" })),
   tasks: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
   chain: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
@@ -184,6 +186,8 @@ export default function (pi: ExtensionAPI) {
   const closingWorkflows = new Set<string>();
   const closingAgents = new Set<string>();
   const closingWorkflowRequests = new Map<string, Promise<string>>();
+  const backgroundJobs = new Map<string, { controller: AbortController; agent: string; task: string; startedAt: number; cancelled: boolean }>();
+  let backgroundSeq = 0; let shuttingDown = false;
   let widgetCtx: ExtensionContext | undefined;
   const updateWidget = () => {
     if (!widgetCtx?.hasUI) return;
@@ -213,8 +217,10 @@ export default function (pi: ExtensionAPI) {
       },
     }));
   };
-  pi.on("session_start", async (_e, ctx) => { widgetCtx = ctx; await removeOldFailedRuns(); updateWidget(); });
+  pi.on("session_start", async (_e, ctx) => { widgetCtx = ctx; shuttingDown = false; await removeOldFailedRuns(); updateWidget(); });
   pi.on("session_shutdown", () => {
+    shuttingDown = true;
+    for (const job of backgroundJobs.values()) { job.cancelled = true; job.controller.abort(); }
     for (const [id, child] of children) { const task = active.get(id); if (task) task.status = "aborted"; child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
     active.clear(); widgetCtx = undefined;
   });
@@ -267,83 +273,7 @@ export default function (pi: ExtensionAPI) {
     return closing;
   };
 
-  pi.registerTool({
-    name: "list_agent_profiles", label: "Agent profiles",
-    description: "List agent profiles currently discoverable by the subagent extension, including their source, description, model, thinking level, and tool restrictions.",
-    promptSnippet: "List profiles available to the subagent tool",
-    parameters: Type.Object({
-      agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user", description: "Which profile locations to include" })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      const scope: AgentScope = params.agentScope ?? "user";
-      const { agents, projectAgentsDir } = discoverAgents(ctx.cwd, scope);
-      const text = agents.length
-        ? agents.map(agent => [
-            `${agent.name} (${agent.source}) — ${agent.description}`,
-            `  model: ${agent.model ?? "inherited"}; thinking: ${agent.thinking ?? "inherited"}`,
-            `  tools: ${agent.tools?.join(", ") ?? "default"}`,
-          ].join("\n")).join("\n")
-        : "No agent profiles found.";
-      const location = scope === "project" || scope === "both" ? `\nProject agents directory: ${projectAgentsDir ?? "none"}` : "";
-      return { content: [{ type: "text", text: `${text}${location}` }] };
-    },
-  });
-
-  pi.registerTool({
-    name: "subagent", label: "Subagent",
-    description: `Delegate isolated work to user agents in ${path.join(getAgentDir(), "agents")}. Default to single mode. Use tasks only when parallel execution is explicitly requested. Child sessions use normal Pi context and compaction rules, are removed on success, and retained for 24 hours on failure. Maximum ${MAX_TASKS} tasks, ${MAX_CONCURRENCY} concurrent, 30 minute default timeout.`,
-    promptSnippet: "Delegate isolated tasks to one or more subagents",
-    promptGuidelines: [
-      "Use subagent in single mode unless the user explicitly requests parallel agents.",
-      "Do not delegate trivial work; use subagent for bounded tasks benefiting from isolated context.",
-      "Subagents cannot create other subagents, and file mutations are guarded by cross-process locks.",
-    ],
-    parameters: Params,
-    async execute(_id, params, signal, onUpdate, ctx) {
-      widgetCtx = ctx;
-      const action = params.action ?? "run";
-      if (action === "list") {
-        const workflows = await listWorkflows(params.workflowId);
-        const text = workflows.length ? workflows.map(w => `${w.workflowId}: ${Object.values(w.agents).map(a => {
-          const active = a.activeRunMs ?? 0;
-          const idle = (a.idleWaitingMs ?? 0) + (a.status !== "running" && a.lastEndedAt ? Math.max(0, Date.now() - Date.parse(a.lastEndedAt)) : 0);
-          return `${a.agentId}=${a.status} (cumulative active run time ${active}ms; persistent idle/waiting time ${idle}ms)`;
-        }).join(", ") || "no agents"}`).join("\n") : "No workflow agents.";
-        return { content: [{ type: "text", text }], details: { mode: "management", results: [], workflows } as Details };
-      }
-      if (action === "closeAgent") {
-        if (!params.workflowId || !params.agentId) throw new Error("closeAgent requires workflowId and agentId");
-        const ownerId = `${safeId(params.workflowId)}:${safeId(params.agentId)}`;
-        if (closingAgents.has(ownerId)) throw new Error(`Workflow agent ${params.workflowId}/${params.agentId} is already closing`);
-        closingAgents.add(ownerId);
-        try {
-          const task = active.get(ownerId);
-          if (task) { task.status = "aborted"; task.reason = "Agent closed"; active.delete(ownerId); }
-          const child = children.get(ownerId);
-          if (child) { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
-          updateWidget();
-          const exit = childExits.get(ownerId); const run = workflowRuns.get(ownerId);
-          await Promise.all([exit, run].filter((value): value is Promise<void> => Boolean(value)));
-          await mutateWorkflow(params.workflowId, async () => {
-            const workflow = await readWorkflow(params.workflowId!); const agent = workflow?.agents[params.agentId!];
-            if (!workflow || !agent) throw new Error(`Unknown workflow agent: ${params.workflowId}/${params.agentId}`);
-            const failed = agent.status === "failed" || agent.status === "aborted";
-            if (!failed) await fs.promises.rm(agent.sessionDir, { recursive: true, force: true });
-            else if (fs.existsSync(agent.sessionDir)) {
-              const retained = path.join(RUN_ROOT, `failed-${Date.now()}-${safeId(params.workflowId!)}-${safeId(params.agentId!)}`);
-              await fs.promises.rename(agent.sessionDir, retained);
-              await fs.promises.utimes(retained, new Date(), new Date());
-            }
-            delete workflow.agents[params.agentId!]; await writeWorkflow(workflow);
-          });
-        } finally { closingAgents.delete(ownerId); }
-        return { content: [{ type: "text", text: `Closed ${params.workflowId}/${params.agentId}` }], details: { mode: "management", results: [] } as Details };
-      }
-      if (action === "closeWorkflow") {
-        if (!params.workflowId) throw new Error("closeWorkflow requires workflowId");
-        const text = await closeWorkflow(params.workflowId);
-        return { content: [{ type: "text", text }], details: { mode: "management", results: [] } as Details };
-      }
+  const runSubagent = async (params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: ((update: any) => void) | undefined, ctx: ExtensionContext) => {
       const workflowLifecycle = params.lifecycle === "workflow";
       if (workflowLifecycle && (!params.workflowId || !params.agentId)) throw new Error("workflow lifecycle requires workflowId and agentId");
       if (workflowLifecycle && (params.tasks?.length || params.chain?.length)) throw new Error("workflow lifecycle supports only agent+task; send one job at a time");
@@ -520,8 +450,150 @@ export default function (pi: ExtensionAPI) {
         if (workflowRunId) { active.delete(workflowRunId); updateWidget(); }
         releaseWorkflowRun?.();
       }
+  };
+
+  // Background jobs run the same code path with their own abort signal, so the
+  // tool call returns at once and the result arrives later as a follow-up message.
+  const cancelBackground = (jobId: string | undefined): boolean => {
+    const job = jobId ? backgroundJobs.get(jobId) : undefined;
+    if (!job) return false;
+    job.cancelled = true; job.controller.abort(); return true;
+  };
+  const describeJobs = () => [...backgroundJobs].map(([jobId, j]) => `${jobId}: ${j.agent} running ${Math.floor((Date.now() - j.startedAt) / 1000)}s — ${j.task.slice(0, 80)}`);
+
+  pi.registerCommand("subagents", {
+    description: "List background subagents, or cancel one: /subagents cancel [jobId|all]",
+    getArgumentCompletions: prefix => {
+      const [sub, arg = ""] = prefix.trimStart().split(/\s+/, 2);
+      if (!prefix.includes(" ")) return ["list", "cancel"].filter(c => c.startsWith(sub)).map(c => ({ value: c, label: c }));
+      if (sub !== "cancel") return null;
+      return [...[...backgroundJobs].map(([id, j]) => ({ value: `cancel ${id}`, label: id, description: `${j.agent}: ${j.task.slice(0, 60)}` })),
+        ...(backgroundJobs.size > 1 ? [{ value: "cancel all", label: "all", description: "Cancel every background subagent" }] : [])]
+        .filter(item => item.label.startsWith(arg));
     },
-    renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? "single" : `${count} agents`), 0, 0); },
-    renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}`).join("\n"), 0, 0); },
+    handler: async (args, ctx) => {
+      const [sub = "list", target] = args.trim().split(/\s+/).filter(Boolean);
+      if (sub === "list") return ctx.ui.notify(backgroundJobs.size ? describeJobs().join("\n") : "No background subagents running.", "info");
+      if (sub !== "cancel") return ctx.ui.notify("Usage: /subagents [list] | /subagents cancel [jobId|all]", "warning");
+      if (!backgroundJobs.size) return ctx.ui.notify("No background subagents running.", "info");
+      // With one job running, a bare cancel is unambiguous.
+      const ids = target === "all" ? [...backgroundJobs.keys()] : target ? [target] : backgroundJobs.size === 1 ? [...backgroundJobs.keys()] : [];
+      if (!ids.length) return ctx.ui.notify(`Several jobs are running; name one or use all:\n${describeJobs().join("\n")}`, "warning");
+      const unknown = ids.filter(id => !cancelBackground(id));
+      if (unknown.length) return ctx.ui.notify(`Unknown background job: ${unknown.join(", ")}`, "error");
+      ctx.ui.notify(`Cancelling ${ids.join(", ")}`, "info");
+    },
+  });
+
+  const startBackground = (params: Static<typeof Params>, ctx: ExtensionContext) => {
+    // One job covers the whole call: a parallel batch or chain is cancelled and reported as a unit.
+    const specs = params.tasks?.length ? params.tasks : params.chain?.length ? params.chain : params.agent && params.task ? [{ agent: params.agent, task: params.task }] : [];
+    if (!specs.length) throw new Error("background needs agent+task, tasks, or chain");
+    const agent = params.tasks?.length ? `parallel: ${specs.map(s => s.agent).join(", ")}` : params.chain?.length ? `chain: ${specs.map(s => s.agent).join(" → ")}` : specs[0].agent;
+    const jobId = `bg-${++backgroundSeq}`;
+    const job = { controller: new AbortController(), agent, task: specs[0].task, startedAt: Date.now(), cancelled: false };
+    backgroundJobs.set(jobId, job);
+    void runSubagent({ ...params, background: undefined }, job.controller.signal, undefined, ctx).then(
+      result => result.content.map(c => c.text).join("\n"),
+      (error: any) => `Background subagent failed: ${error?.message ?? String(error)}`,
+    ).then(text => {
+      backgroundJobs.delete(jobId);
+      if (shuttingDown) return;
+      pi.sendMessage({ customType: "subagent-background-result", display: true, content: `[${jobId}] ${job.agent} ${job.cancelled ? "cancelled" : "finished"}\n\n${text}`, details: { jobId, agent: job.agent } },
+        { triggerTurn: !job.cancelled, deliverAs: "followUp" });
+    });
+    return { content: [{ type: "text" as const, text: `Started background subagent ${jobId} (${agent}). Its result will arrive as a follow-up message; do not wait or poll for it. Cancel with { action: "cancel", jobId: "${jobId}" }.` }],
+      details: { mode: "single", results: [], jobId } as Details };
+  };
+
+  pi.registerTool({
+    name: "list_agent_profiles", label: "Agent profiles",
+    description: "List agent profiles currently discoverable by the subagent extension, including their source, description, model, thinking level, and tool restrictions.",
+    promptSnippet: "List profiles available to the subagent tool",
+    parameters: Type.Object({
+      agentScope: Type.Optional(StringEnum(["user", "project", "both"] as const, { default: "user", description: "Which profile locations to include" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const scope: AgentScope = params.agentScope ?? "user";
+      const { agents, projectAgentsDir } = discoverAgents(ctx.cwd, scope);
+      const text = agents.length
+        ? agents.map(agent => [
+            `${agent.name} (${agent.source}) — ${agent.description}`,
+            `  model: ${agent.model ?? "inherited"}; thinking: ${agent.thinking ?? "inherited"}`,
+            `  tools: ${agent.tools?.join(", ") ?? "default"}`,
+          ].join("\n")).join("\n")
+        : "No agent profiles found.";
+      const location = scope === "project" || scope === "both" ? `\nProject agents directory: ${projectAgentsDir ?? "none"}` : "";
+      return { content: [{ type: "text", text: `${text}${location}` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent", label: "Subagent",
+    description: `Delegate isolated work to user agents in ${path.join(getAgentDir(), "agents")}. Default to single mode. Use tasks only when parallel execution is explicitly requested. Child sessions use normal Pi context and compaction rules, are removed on success, and retained for 24 hours on failure. Maximum ${MAX_TASKS} tasks, ${MAX_CONCURRENCY} concurrent, 30 minute default timeout.`,
+    promptSnippet: "Delegate isolated tasks to one or more subagents",
+    promptGuidelines: [
+      "Use subagent in single mode unless the user explicitly requests parallel agents.",
+      "Do not delegate trivial work; use subagent for bounded tasks benefiting from isolated context.",
+      "Subagents cannot create other subagents, and file mutations are guarded by cross-process locks.",
+      "Set background: true (any mode) to keep working while the subagent runs; its result arrives later as a follow-up message, so do not poll for it.",
+    ],
+    parameters: Params,
+    async execute(_id, params, signal, onUpdate, ctx) {
+      widgetCtx = ctx;
+      const action = params.action ?? "run";
+      if (action === "list") {
+        const workflows = await listWorkflows(params.workflowId);
+        const workflowText = workflows.length ? workflows.map(w => `${w.workflowId}: ${Object.values(w.agents).map(a => {
+          const active = a.activeRunMs ?? 0;
+          const idle = (a.idleWaitingMs ?? 0) + (a.status !== "running" && a.lastEndedAt ? Math.max(0, Date.now() - Date.parse(a.lastEndedAt)) : 0);
+          return `${a.agentId}=${a.status} (cumulative active run time ${active}ms; persistent idle/waiting time ${idle}ms)`;
+        }).join(", ") || "no agents"}`).join("\n") : "No workflow agents.";
+        const jobs = describeJobs();
+        const text = `${workflowText}\n\n${jobs.length ? `Background jobs:\n${jobs.join("\n")}` : "No background jobs."}`;
+        return { content: [{ type: "text", text }], details: { mode: "management", results: [], workflows } as Details };
+      }
+      if (action === "cancel") {
+        if (!cancelBackground(params.jobId)) throw new Error(`Unknown background job: ${params.jobId ?? "(missing jobId)"}`);
+        return { content: [{ type: "text", text: `Cancelling ${params.jobId}` }], details: { mode: "management", results: [], jobId: params.jobId } as Details };
+      }
+      if (action === "closeAgent") {
+        if (!params.workflowId || !params.agentId) throw new Error("closeAgent requires workflowId and agentId");
+        const ownerId = `${safeId(params.workflowId)}:${safeId(params.agentId)}`;
+        if (closingAgents.has(ownerId)) throw new Error(`Workflow agent ${params.workflowId}/${params.agentId} is already closing`);
+        closingAgents.add(ownerId);
+        try {
+          const task = active.get(ownerId);
+          if (task) { task.status = "aborted"; task.reason = "Agent closed"; active.delete(ownerId); }
+          const child = children.get(ownerId);
+          if (child) { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
+          updateWidget();
+          const exit = childExits.get(ownerId); const run = workflowRuns.get(ownerId);
+          await Promise.all([exit, run].filter((value): value is Promise<void> => Boolean(value)));
+          await mutateWorkflow(params.workflowId, async () => {
+            const workflow = await readWorkflow(params.workflowId!); const agent = workflow?.agents[params.agentId!];
+            if (!workflow || !agent) throw new Error(`Unknown workflow agent: ${params.workflowId}/${params.agentId}`);
+            const failed = agent.status === "failed" || agent.status === "aborted";
+            if (!failed) await fs.promises.rm(agent.sessionDir, { recursive: true, force: true });
+            else if (fs.existsSync(agent.sessionDir)) {
+              const retained = path.join(RUN_ROOT, `failed-${Date.now()}-${safeId(params.workflowId!)}-${safeId(params.agentId!)}`);
+              await fs.promises.rename(agent.sessionDir, retained);
+              await fs.promises.utimes(retained, new Date(), new Date());
+            }
+            delete workflow.agents[params.agentId!]; await writeWorkflow(workflow);
+          });
+        } finally { closingAgents.delete(ownerId); }
+        return { content: [{ type: "text", text: `Closed ${params.workflowId}/${params.agentId}` }], details: { mode: "management", results: [] } as Details };
+      }
+      if (action === "closeWorkflow") {
+        if (!params.workflowId) throw new Error("closeWorkflow requires workflowId");
+        const text = await closeWorkflow(params.workflowId);
+        return { content: [{ type: "text", text }], details: { mode: "management", results: [] } as Details };
+      }
+      if (params.background) return startBackground(params, ctx);
+      return runSubagent(params, signal, onUpdate, ctx);
+    },
+    renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? "single" : `${count} agents`) + (args.background ? theme.fg("muted", " (background)") : ""), 0, 0); },
+    renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); if (d.jobId) return new Text(theme.fg("muted", d.mode === "management" ? `cancelling ${d.jobId}` : `started ${d.jobId} in background`), 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}`).join("\n"), 0, 0); },
   });
 }
