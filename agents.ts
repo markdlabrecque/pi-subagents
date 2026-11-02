@@ -132,10 +132,16 @@ export function loadProvidedAgents(): AgentConfig[] {
 			continue;
 		}
 		if (!Array.isArray(list)) continue;
-		for (const a of list) {
-			if (!a || typeof a.name !== "string" || typeof a.description !== "string" || typeof a.systemPrompt !== "string") continue;
-			if (a.thinking !== undefined && !THINKING.includes(a.thinking)) continue;
-			const maxTokens = Number.isSafeInteger(a.maxTokens) && a.maxTokens > 0 ? a.maxTokens : undefined;
+		for (const a of list) try {
+			if (!a || typeof a !== "object") continue;
+			const { name, description, tools, model, thinking, systemPrompt, source, filePath } = a;
+			if (typeof name !== "string" || !name.trim() || typeof description !== "string" || !description.trim()) continue;
+			if (typeof systemPrompt !== "string" || (filePath !== undefined && (typeof filePath !== "string" || !filePath.trim())) || (source !== undefined && source !== "user")) continue;
+			if (tools !== undefined && (!Array.isArray(tools) || !tools.every(t => typeof t === "string"))) continue;
+			if (model !== undefined && typeof model !== "string") continue;
+			if (thinking !== undefined && !THINKING.includes(thinking)) continue;
+			if (a.maxTokens !== undefined && (!Number.isSafeInteger(a.maxTokens) || a.maxTokens <= 0)) continue;
+			const maxTokens = a.maxTokens;
 			agents.push({
 				name: a.name,
 				description: a.description,
@@ -147,7 +153,7 @@ export function loadProvidedAgents(): AgentConfig[] {
 				source: "user",
 				filePath: typeof a.filePath === "string" ? a.filePath : `provider:${owner}`,
 			});
-		}
+		} catch { continue; }
 	}
 	return agents;
 }

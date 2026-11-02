@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -102,7 +103,7 @@ const maxTokensOverride = await jiti.import(path.join(root, "max-tokens-override
 
 test("terminal API remains present and workflow API is additive", () => {
   for (const field of ["agent:", "task:", "tasks:", "chain:"]) assert.match(index, new RegExp(field));
-  for (const action of ["run", "list", "closeAgent", "closeWorkflow"]) assert.match(index, new RegExp(`\\\"${action}\\\"`));
+  for (const action of ["run", "list", "cancel", "closeAgent", "closeWorkflow"]) assert.match(index, new RegExp(`\\\"${action}\\\"`));
   assert.match(index, /workflowLifecycle \? .* : `\$\{runId\}-\$\{index \+ 1\}`/);
 });
 
@@ -127,12 +128,11 @@ test("workflow owner and session handles are stable", () => {
   assert.match(index, /PI_SUBAGENT_ID: id/);
 });
 
-test("max-token resolution honors per-call, resumed, profile, and workflow-role precedence", () => {
+test("max-token resolution honors per-call, resumed, and profile precedence", () => {
   const { resolveMaxTokens, clampMaxTokens } = subagentModule;
-  assert.equal(resolveMaxTokens({ perCall: 1024, existing: 2048, profile: 4096, workflowRole: 8192 }), 1024, "per-call wins");
-  assert.equal(resolveMaxTokens({ existing: 2048, profile: 4096, workflowRole: 8192 }), 2048, "resumed workflow agent keeps its prior limit");
-  assert.equal(resolveMaxTokens({ profile: 4096, workflowRole: 8192 }), 4096, "profile overrides workflow role default");
-  assert.equal(resolveMaxTokens({ workflowRole: 8192 }), 8192, "workflow role supplies the final default");
+  assert.equal(resolveMaxTokens({ perCall: 1024, existing: 2048, profile: 4096 }), 1024, "per-call wins");
+  assert.equal(resolveMaxTokens({ existing: 2048, profile: 4096 }), 2048, "resumed workflow agent keeps its prior limit");
+  assert.equal(resolveMaxTokens({ profile: 4096 }), 4096, "profile supplies the final default");
   assert.equal(resolveMaxTokens({ perCall: -1, profile: 4096 }), 4096, "invalid override is ignored");
   assert.equal(clampMaxTokens(65536, 32768), 32768, "limit never exceeds selected model maximum");
   assert.equal(clampMaxTokens(4096, undefined), 4096);
@@ -158,6 +158,103 @@ test("profile maxTokens accepts only positive integers", async () => {
   }
 });
 
+const agentProviders = Symbol.for("pi-subagents.agent-providers");
+
+async function withAgentDiscovery(run) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-agent-discovery-"));
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const priorRegistry = Object.getOwnPropertyDescriptor(globalThis, agentProviders);
+  try {
+    const userDir = path.join(dir, "user");
+    const cwd = path.join(dir, "project");
+    await mkdir(path.join(userDir, "agents"), { recursive: true });
+    await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
+    process.env.PI_CODING_AGENT_DIR = userDir;
+    globalThis[agentProviders] = new Map();
+    const { discoverAgents } = await jiti.import(path.join(root, "agents.ts"));
+    const profile = (name, overrides = {}) => ({
+      name, description: "provider profile", systemPrompt: "Stage instructions.",
+      source: "user", filePath: `/provider/${name}.md`, ...overrides,
+    });
+    const writeProfile = (source, name) => writeFile(
+      path.join(source === "user" ? userDir : path.join(cwd, ".pi"), "agents", `${name}.md`),
+      `---\nname: ${name}\ndescription: ${source} file profile\n---\n${source} instructions.`,
+    );
+    await run({ discover: scope => discoverAgents(cwd, scope), profile, writeProfile });
+  } finally {
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    if (priorRegistry) Object.defineProperty(globalThis, agentProviders, priorRegistry);
+    else delete globalThis[agentProviders];
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("provider discovery includes live user profiles in user and both scopes", async () => {
+  await withAgentDiscovery(async ({ discover, profile }) => {
+    assert.deepEqual(discover("user").agents, []);
+    const agent = profile("orchestration:test-writer", { tools: ["read", "edit"], model: "provider/model", thinking: "high", maxTokens: 4096 });
+    let calls = 0;
+    globalThis[agentProviders].set("orchestration", () => { calls++; return [agent]; });
+    for (const scope of ["user", "both"]) assert.deepEqual(discover(scope).agents, [agent]);
+    agent.systemPrompt = "Updated instructions.";
+    assert.equal(discover("user").agents[0].systemPrompt, "Updated instructions.");
+    assert.equal(calls, 3, "providers are evaluated on each discovery, not cached");
+  });
+});
+
+test("file profiles retain user and project precedence over provider profiles", async () => {
+  await withAgentDiscovery(async ({ discover, profile, writeProfile }) => {
+    globalThis[agentProviders].set("stages", () => [profile("shared"), profile("provider-only")]);
+    await writeProfile("user", "shared");
+    await writeProfile("project", "shared");
+    assert.equal(discover("user").agents.find(a => a.name === "shared").description, "user file profile");
+    const both = discover("both").agents;
+    assert.equal(both.find(a => a.name === "shared").source, "project");
+    assert.equal(both.find(a => a.name === "shared").description, "project file profile");
+    assert.equal(both.filter(a => a.name === "shared").length, 1);
+    assert.equal(both.find(a => a.name === "provider-only").source, "user");
+  });
+});
+
+test("project-only discovery never invokes user providers", async () => {
+  await withAgentDiscovery(async ({ discover, writeProfile }) => {
+    let calls = 0;
+    globalThis[agentProviders].set("stages", () => { calls++; throw new Error("must not run"); });
+    await writeProfile("user", "user-only");
+    await writeProfile("project", "project-only");
+    const result = discover("project");
+    assert.deepEqual(result.agents.map(a => a.name), ["project-only"]);
+    assert.ok(result.projectAgentsDir.endsWith(path.join(".pi", "agents")));
+    assert.equal(calls, 0);
+  });
+});
+
+test("provider discovery isolates failures and rejects malformed entries", async () => {
+  await withAgentDiscovery(async ({ discover, profile, writeProfile }) => {
+    await writeProfile("user", "file-only");
+    for (const registry of [undefined, {}, []]) {
+      globalThis[agentProviders] = registry;
+      assert.deepEqual(discover("user").agents.map(a => a.name), ["file-only"]);
+    }
+    const throwingEntry = Object.defineProperty({}, "name", { get() { throw new Error("bad getter"); } });
+    globalThis[agentProviders] = new Map([
+      ["throws", () => { throw new Error("provider failed"); }],
+      ["not-callable", 42],
+      ["not-array", () => ({})],
+      ["malformed", () => [null, 42, {}, throwingEntry,
+        ...[ { name: "" }, { description: 42 }, { systemPrompt: null }, { filePath: null },
+          { source: "project" }, { tools: "read" }, { tools: [42] }, { model: 42 },
+          { thinking: "invalid" }, { maxTokens: -1 }, { maxTokens: 1.5 },
+        ].map(overrides => profile("invalid", overrides)),
+        profile("valid-after-invalid"),
+      ]],
+      ["healthy", () => [profile("healthy")]],
+    ]);
+    assert.deepEqual(discover("user").agents.map(a => a.name).sort(), ["file-only", "healthy", "valid-after-invalid"]);
+  });
+});
+
 test("child max-token override clamps runtime models and terminal calls stay unchanged without a limit", () => {
   const model = { maxTokens: 32768 };
   assert.equal(maxTokensOverride.applyMaxTokens(model, 65536), 32768);
@@ -177,7 +274,6 @@ test("cleanup and failure retention are explicit", () => {
   assert.match(index, /await Promise\.all\(exits\)/);
   assert.match(index, /filter\(a => a\.status === "done"\).*fs\.promises\.rm/s);
   assert.match(index, /await fs\.promises\.utimes\(retained, new Date\(\), new Date\(\)\)/);
-  assert.match(index, /pi\.events\.on\("subagent:request"/);
   assert.match(index, /const text = await closeWorkflow\(params\.workflowId\)/);
   assert.match(index, /workflowRuns\.has\(workflowRunId\)/);
   assert.match(index, /closingWorkflowRequests\.get\(workflowId\)/);
@@ -250,7 +346,7 @@ test("workflow setup failures retain their original error", async () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(path.join(runDir, "session-researcher"), "force lifecycle session mkdir failure");
     const pi = {
-      events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); },
+      events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {},
       getThinkingLevel() { return "medium"; },
     };
     const childFlag = process.env.PI_SUBAGENT_CHILD;
@@ -271,6 +367,56 @@ test("workflow setup failures retain their original error", async () => {
     await rm(runDir, { recursive: true, force: true });
     await rm(workflowDir, { recursive: true, force: true });
   }
+});
+
+function loadWithFakePi() {
+  const tools = new Map(); const commands = new Map(); const messages = []; const handlers = new Map();
+  const pi = {
+    events: { on() {} }, on(name, fn) { handlers.set(name, fn); }, registerTool(tool) { tools.set(tool.name, tool); },
+    registerCommand(name, command) { commands.set(name, command); },
+    getThinkingLevel() { return "medium"; }, sendMessage(message, options) { messages.push({ message, options }); },
+  };
+  subagentModule.default(pi);
+  return { subagent: tools.get("subagent"), command: commands.get("subagents"), messages, handlers };
+}
+
+test("background runs return at once and deliver the outcome as a follow-up turn", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-subagent-background-"));
+  try {
+    const { subagent, messages } = loadWithFakePi();
+    const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
+    const started = await subagent.execute("bg", { agent: "no-such-agent", task: "x", background: true }, undefined, undefined, ctx);
+    assert.match(started.content[0].text, /Started background subagent bg-1/);
+    assert.equal(started.details.jobId, "bg-1");
+    for (let i = 0; i < 50 && !messages.length; i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(messages.length, 1);
+    assert.match(messages[0].message.content, /\[bg-1\] no-such-agent finished[\s\S]*Unknown agents: no-such-agent/);
+    assert.deepEqual(messages[0].options, { triggerTurn: true, deliverAs: "followUp" });
+    const listed = await subagent.execute("list", { action: "list" }, undefined, undefined, ctx);
+    assert.match(listed.content[0].text, /No background jobs\./);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
+test("parallel and chain calls run as one background job each; cancel needs a live job", async () => {
+  const { subagent, messages } = loadWithFakePi();
+  const ctx = { cwd: os.tmpdir(), hasUI: false, ui: { setWidget() {} } };
+  const parallel = await subagent.execute("bg", { tasks: [{ agent: "a", task: "t" }, { agent: "b", task: "t" }], background: true }, undefined, undefined, ctx);
+  const chain = await subagent.execute("bg", { chain: [{ agent: "c", task: "t" }, { agent: "d", task: "{previous}" }], background: true }, undefined, undefined, ctx);
+  assert.match(parallel.content[0].text, /bg-1 \(parallel: a, b\)/);
+  assert.match(chain.content[0].text, /bg-2 \(chain: c → d\)/);
+  for (let i = 0; i < 50 && messages.length < 2; i++) await new Promise(r => setTimeout(r, 10));
+  assert.equal(messages.length, 2, "each call reports once, not once per child");
+  await assert.rejects(subagent.execute("c", { action: "cancel", jobId: "bg-9" }, undefined, undefined, ctx), /Unknown background job: bg-9/);
+});
+
+test("/subagents cancel reports unknown jobs and an empty queue", async () => {
+  const { command } = loadWithFakePi();
+  const notes = []; const ctx = { ui: { notify(text, type) { notes.push([type, text]); } } };
+  await command.handler("cancel", ctx);
+  await command.handler("bogus", ctx);
+  assert.deepEqual(notes.map(([type]) => type), ["info", "warning"]);
+  assert.match(notes[0][1], /No background subagents running/);
+  assert.deepEqual(command.getArgumentCompletions("ca").map(i => i.value), ["cancel"]);
 });
 
 test("stub dispatch retains workflow exclusion and metadata without automatic commits", async t => {
@@ -307,7 +453,7 @@ if (role) {
   const tools = new Map();
   const childFlag = process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SUBAGENT_CHILD;
-  try { subagentModule.default({ events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, getThinkingLevel() { return "medium"; } }); }
+  try { subagentModule.default({ events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {}, getThinkingLevel() { return "medium"; } }); }
   finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
   const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() {} } };
   const execute = (params, signal) => tools.get("subagent").execute("stub", { agent: "reviewer", task: "read-only review", agentScope: "project", confirmProjectAgents: false, ...params }, signal, undefined, ctx);

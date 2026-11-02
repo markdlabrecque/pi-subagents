@@ -25,11 +25,28 @@ The parent model calls `subagent` in one of these modes:
 { action: "closeWorkflow", workflowId: "workflow-123" }
 ```
 
+### Background runs
+
+Single, parallel (`tasks`), and chain calls accept `background: true`. The tool returns a job id at once, so the parent can keep working or answer the user. One job covers the whole call: cancelling it stops every child in the batch or chain, and once the last child ends, the combined result is posted to the session as a `subagent-background-result` follow-up message that wakes the parent.
+
+```ts
+{ agent: "reviewer", task: "Review ...", background: true }   // -> "Started background subagent bg-1 ..."
+{ tasks: [{ agent: "scout", task: "..." }, { agent: "reviewer", task: "..." }], background: true }   // one job, bg-2
+{ action: "list" }                                            // shows running background jobs
+{ action: "cancel", jobId: "bg-1" }                           // stops it; the cancel notice does not wake the parent
+```
+
+You can also manage them yourself without asking the agent: `/subagents` lists running jobs, `/subagents cancel` stops the only running job, and `/subagents cancel <jobId>` or `/subagents cancel all` picks which ones. Tab completes job ids.
+
+Background runs need a long-lived session (interactive or RPC). In print mode (`-p`) Pi exits when the parent finishes its turn, which kills the child. Ending the session cancels all background jobs. The main agent's own edits are not covered by the file guard, so a background child and the parent can touch the same file.
+
 Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, 30 minutes per child, and 50 KB of model-visible output per child.
 
 ## Agent profiles
 
-Profiles live in `~/.pi/agent/agents/*.md`. Project profiles in `.pi/agents/*.md` are disabled by default and require `agentScope: "project"` or `"both"`; interactive runs ask for confirmation.
+Use the `list_agent_profiles` tool to see profiles currently discoverable by the extension, including their source and configuration. It accepts `agentScope: "user"` (default), `"project"`, or `"both"`; project-local profiles are listed but are still subject to confirmation when launched.
+
+Profiles live in `~/.pi/agent/agents/*.md`.  Project profiles in `.pi/agents/*.md` are disabled by default and require `agentScope: "project"` or `"both"`; interactive runs ask for confirmation.
 
 ```markdown
 ---
@@ -67,7 +84,7 @@ Providers are called on every discovery, so edits to their sources apply to the 
 - Each child gets its own persisted session directory while running.
 - Successful terminal run directories and sessions are deleted after all tasks finish.
 - Failed run directories remain under the system temporary directory for 24 hours, and their paths are returned to the parent.
-- `closeWorkflow` is the single cleanup action used by both the `subagent` tool and trusted inter-extension requests. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first metadata write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
+- `closeWorkflow` is the single cleanup action used by the `subagent` tool. Concurrent requests share one in-flight close. It aborts running children (including runs still preparing their first metadata write), waits for their exits, removes successful sessions and metadata, and retains only failed diagnostics for a fresh 24-hour window. Cleanup errors leave workflow metadata intact for recovery or retry. Parent cancellation propagates SIGTERM and then SIGKILL after five seconds without silently deleting resumable workflow state.
 - `closeAgent` likewise waits for a running child, clears its active-widget entry, removes successful sessions, and retains aborted/failed agent diagnostics for 24 hours.
 - A workflow agent rejects a concurrent run for the same stable `(workflowId, agentId)`. Workflow metadata updates are serialized across agents in the same workflow. This does not serialize their file changes.
 - Chains stop at the first failed child.
