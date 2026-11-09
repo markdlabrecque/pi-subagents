@@ -75,7 +75,7 @@ providers.set("my-package", () => [
 ]);
 ```
 
-Providers are called on every discovery, so edits to their sources apply to the next dispatch. Their profiles count as user scope; a file in `~/.pi/agent/agents` with the same name wins. Entries without `name`, `description` or `systemPrompt`, or with an invalid `thinking`, are skipped. The `orchestration` package uses this for its stage agents (`orchestration:test-writer`, `orchestration:implementor`, ...).
+Providers are called on every discovery, so edits to their sources apply to the next dispatch. Their profiles count as user scope; a file in `~/.pi/agent/agents` with the same name wins. Entries without `name`, `description` or `systemPrompt`, or with an invalid `thinking`, are skipped.
 
 ## Isolation and lifecycle
 
