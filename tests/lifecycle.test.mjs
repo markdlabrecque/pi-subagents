@@ -193,9 +193,9 @@ async function withAgentDiscovery(run) {
 test("provider discovery includes live user profiles in user and both scopes", async () => {
   await withAgentDiscovery(async ({ discover, profile }) => {
     assert.deepEqual(discover("user").agents, []);
-    const agent = profile("orchestration:test-writer", { tools: ["read", "edit"], model: "provider/model", thinking: "high", maxTokens: 4096 });
+    const agent = profile("my-extension:worker", { tools: ["read", "edit"], model: "provider/model", thinking: "high", maxTokens: 4096 });
     let calls = 0;
-    globalThis[agentProviders].set("orchestration", () => { calls++; return [agent]; });
+    globalThis[agentProviders].set("my-extension", () => { calls++; return [agent]; });
     for (const scope of ["user", "both"]) assert.deepEqual(discover(scope).agents, [agent]);
     agent.systemPrompt = "Updated instructions.";
     assert.equal(discover("user").agents[0].systemPrompt, "Updated instructions.");
