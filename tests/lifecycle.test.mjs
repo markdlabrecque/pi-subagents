@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -7,6 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+const inheritedChildEnv = Object.fromEntries(["PI_SUBAGENT_CHILD", "PI_WORKFLOW_ID", "PI_WORKFLOW_ROLE"].map(key => [key, process.env[key]]));
+for (const key of Object.keys(inheritedChildEnv)) delete process.env[key];
+test.after(() => { for (const [key, value] of Object.entries(inheritedChildEnv)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
 const root = path.resolve(import.meta.dirname, "..");
 const index = await readFile(path.join(root, "index.ts"), "utf8");
 const widgetLayout = await readFile(path.join(root, "widget-layout.ts"), "utf8");
@@ -101,6 +104,14 @@ test("nested delegation remains blocked without ownership coordination", async t
 });
 const maxTokensOverride = await jiti.import(path.join(root, "max-tokens-override.ts"));
 
+function registerProfiles(pi) {
+  const prior = process.env.PI_SUBAGENT_PROFILES;
+  process.env.PI_SUBAGENT_PROFILES = "1";
+  try { subagentModule.default(pi); } finally {
+    if (prior === undefined) delete process.env.PI_SUBAGENT_PROFILES; else process.env.PI_SUBAGENT_PROFILES = prior;
+  }
+}
+
 test("terminal API remains present and workflow API is additive", () => {
   for (const field of ["agent:", "task:", "tasks:", "chain:"]) assert.match(index, new RegExp(field));
   for (const action of ["run", "list", "cancel", "closeAgent", "closeWorkflow"]) assert.match(index, new RegExp(`\\\"${action}\\\"`));
@@ -142,7 +153,7 @@ test("max-token resolution honors per-call, resumed, and profile precedence", ()
 test("tool schemas preserve scope, thinking, and maxTokens validation", async () => {
   const { Check } = await import(piRequire.resolve("typebox/value"));
   const tools = new Map();
-  subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+  registerProfiles({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
   const params = tools.get("subagent").parameters;
   const profiles = tools.get("list_agent_profiles").parameters;
   for (const scope of ["user", "project", "both"]) {
@@ -181,7 +192,7 @@ test("profile listing and management return complete tool results", async t => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-tool-results-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const tools = new Map();
-  subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+  registerProfiles({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
   const ctx = { cwd, hasUI: false };
   const listed = await tools.get("list_agent_profiles").execute("profiles", { agentScope: "project" }, undefined, undefined, ctx);
   assert.ok(Object.hasOwn(listed, "details"), "Pi requires a details field even without structured data");
@@ -426,7 +437,7 @@ test("workflow setup failures retain their original error", async () => {
     };
     const childFlag = process.env.PI_SUBAGENT_CHILD;
     delete process.env.PI_SUBAGENT_CHILD;
-    try { subagentModule.default(pi); } finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
+    try { registerProfiles(pi); } finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
     const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
     const error = await tools.get("subagent").execute("setup", {
       action: "run", lifecycle: "workflow", workflowId, agentId: "researcher", agent: "researcher", task: "research", agentScope: "project", confirmProjectAgents: false,
@@ -451,7 +462,7 @@ function loadWithFakePi() {
     registerCommand(name, command) { commands.set(name, command); },
     getThinkingLevel() { return "medium"; }, sendMessage(message, options) { messages.push({ message, options }); },
   };
-  subagentModule.default(pi);
+  registerProfiles(pi);
   return { subagent: tools.get("subagent"), command: commands.get("subagents"), messages, handlers };
 }
 
@@ -531,7 +542,7 @@ if (role) {
   const metricsEvents = [];
   let deliverBackground;
   const backgroundDone = new Promise(resolve => { deliverBackground = resolve; });
-  try { subagentModule.default({ events: { on() {}, emit(name, data) { metricsEvents.push({ name, data }); } }, on() {},
+  try { registerProfiles({ events: { on() {}, emit(name, data) { metricsEvents.push({ name, data }); } }, on() {},
     sendMessage() { deliverBackground(); }, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {}, getThinkingLevel() { return "medium"; } }); }
   finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
   const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() {} } };
@@ -647,6 +658,134 @@ test("child metrics are exactly once, preserve missing fields, and isolate liste
   assert.equal(events[1].data.usage.cost, null); assert.equal(events[1].data.taskIndex, 2);
   const broken = subagentModule.createChildMetrics(() => { throw new Error("listener failed"); });
   assert.doesNotThrow(() => broken.finish({ status: "done", agent: "worker" }));
+});
+
+test("profile mode is captured at registration and defaults to task-only", async () => {
+  const prior = process.env.PI_SUBAGENT_PROFILES;
+  const { Check } = await import(piRequire.resolve("typebox/value"));
+  try {
+    for (const value of [undefined, "", "0", "true", "1"]) {
+      if (value === undefined) delete process.env.PI_SUBAGENT_PROFILES; else process.env.PI_SUBAGENT_PROFILES = value;
+      const tools = new Map();
+      subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+      assert.equal(tools.has("list_agent_profiles"), value === "1");
+      const tool = tools.get("subagent");
+      assert.match(tool.description, value === "1" ? /exact named profile/ : /built-in general-purpose/);
+      assert.equal(tool.parameters.properties.tasks.items.required.includes("agent"), value === "1");
+      if (value !== "1") {
+        process.env.PI_SUBAGENT_PROFILES = "1";
+        assert.equal(Check(tool.parameters, { task: "x", agentScope: "x" }), true);
+        assert.equal(Check(tool.parameters, { task: "x", confirmProjectAgents: "invalid" }), true);
+        for (const fields of [{ agent: "general" }, { agent: "" }, { agentScope: "user" }, { agentScope: "x" }, { confirmProjectAgents: false }, { confirmProjectAgents: "invalid" }, { tasks: [{ task: "x", agent: "worker" }] }, { chain: [{ task: "x", agent: "" }] }]) {
+          await assert.rejects(tool.execute("x", { task: "x", background: true, ...fields }, undefined, undefined, { cwd: os.tmpdir() }), /Named profiles are disabled/);
+        }
+      }
+    }
+  } finally { if (prior === undefined) delete process.env.PI_SUBAGENT_PROFILES; else process.env.PI_SUBAGENT_PROFILES = prior; }
+});
+
+test("built-in dispatch runs all modes and preserves workflow identity", async t => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-general-stub-"));
+  const childCwd = path.join(cwd, "child");
+  const workflowId = `general-${process.pid}-${Date.now()}`;
+  const workflowDir = path.join(testAgentDir, "runtime", "subagent-workflows", workflowId);
+  const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
+  const priorScript = process.argv[1], priorProfiles = process.env.PI_SUBAGENT_PROFILES, priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const priorRegistry = Object.getOwnPropertyDescriptor(globalThis, agentProviders);
+  t.after(async () => {
+    process.argv[1] = priorScript;
+    if (priorProfiles === undefined) delete process.env.PI_SUBAGENT_PROFILES; else process.env.PI_SUBAGENT_PROFILES = priorProfiles;
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+    await rm(path.join(testAgentDir, "agents", "general.md"), { force: true });
+    if (priorRegistry) Object.defineProperty(globalThis, agentProviders, priorRegistry); else delete globalThis[agentProviders];
+    await rm(cwd, { recursive: true, force: true }); await rm(workflowDir, { recursive: true, force: true }); await rm(runDir, { recursive: true, force: true });
+  });
+  await mkdir(path.join(cwd, ".pi", "agents"), { recursive: true });
+  await mkdir(path.join(testAgentDir, "agents"), { recursive: true });
+  await mkdir(childCwd);
+  const conflicting = "---\nname: general\ndescription: conflicting\nmodel: bad/model\ntools: read\nmaxTokens: 7\n---\nwrong prompt";
+  await writeFile(path.join(cwd, ".pi", "agents", "general.md"), conflicting);
+  await writeFile(path.join(testAgentDir, "agents", "general.md"), conflicting);
+  process.env.PI_CODING_AGENT_DIR = testAgentDir;
+  let providerCalls = 0;
+  globalThis[agentProviders] = new Map([["throws", () => { providerCalls++; throw Error("must not run"); }]]);
+  const script = path.join(cwd, "stub.cjs");
+  await writeFile(script, `const fs=require('fs'),path=require('path'); const a=process.argv.slice(2); fs.appendFileSync(path.join(process.cwd(),'calls'),JSON.stringify({args:a,env:process.env.PI_SUBAGENT_MAX_TOKENS,prompt:fs.readFileSync(a[a.indexOf('--append-system-prompt')+1],'utf8')})+'\\n'); const dir=a[a.indexOf('--session-dir')+1]; fs.writeFileSync(path.join(dir,'session.jsonl'),'stub'); setTimeout(()=>console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'stub output'}],model:'stub',usage:{},stopReason:'stop'}})),80);`);
+  process.argv[1] = script; delete process.env.PI_SUBAGENT_PROFILES;
+  const tools = new Map(), messages = [], events = [];
+  subagentModule.default({ events: { emit(name, data) { events.push({ name, data }); } }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); }, getThinkingLevel() { return "high"; }, sendMessage(message) { messages.push(message); } });
+  const ctx = { cwd, hasUI: false, ui: {}, model: { provider: "parent", id: "model", maxTokens: 100 }, modelRegistry: { find() { return { maxTokens: 100 }; } } };
+  const execute = params => tools.get("subagent").execute("test", { cwd: childCwd, ...params }, undefined, undefined, ctx);
+  assert.equal((await execute({ task: "single", maxTokens: 200 })).details.results[0].agent, "general");
+  assert.equal((await execute({ tasks: [{ task: "a", cwd: childCwd }, { task: "b", cwd: childCwd, model: "override/model", thinking: "low" }] })).details.results.length, 2);
+  const chain = await execute({ chain: [{ task: "first", cwd: childCwd }, { task: "next {previous}", cwd: childCwd }] });
+  assert.equal(chain.details.results[1].task, "next stub output");
+  const bg = await execute({ task: "background", background: true });
+  assert.match(bg.content[0].text, /general/);
+  for (let i = 0; i < 100 && !messages.length; i++) await new Promise(r => setTimeout(r, 10));
+  assert.match(messages[0].content, /general finished/);
+  const params = { lifecycle: "workflow", workflowId, agentId: "role", task: "work" };
+  const pending = execute(params);
+  await assert.rejects(execute(params), /already running/);
+  await pending; await execute(params); await execute({ ...params, freshSession: true });
+  const recordPath = path.join(workflowDir, "workflow.json");
+  let record = JSON.parse(await readFile(recordPath, "utf8"));
+  assert.equal(record.agents.role.profile, "general");
+  assert.equal(record.agents.role.builtin, true);
+  assert.equal(record.agents.role.cwd, childCwd);
+  assert.ok(!(await readdir(record.agents.role.sessionDir)).includes(".builtin-general"));
+  await rm(record.agents.role.sessionDir, { recursive: true, force: true });
+  await execute(params);
+  let calls = (await readFile(path.join(childCwd, "calls"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(!calls.at(-1).args.includes("--session"), "missing session directory starts without --session");
+  record = JSON.parse(await readFile(recordPath, "utf8"));
+  await rm(record.agents.role.sessionDir, { recursive: true, force: true });
+  await execute({ ...params, freshSession: true });
+  calls = (await readFile(path.join(childCwd, "calls"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(!calls.at(-1).args.includes("--session"));
+  record = JSON.parse(await readFile(recordPath, "utf8"));
+  assert.ok(!(await readdir(record.agents.role.sessionDir)).includes(".builtin-general"));
+  const timed = await execute({ task: "timeout", timeoutMinutes: 0.0001 });
+  assert.equal(timed.details.results[0].status, "failed");
+  assert.match(timed.details.results[0].reason, /Timed out/);
+  await rm(path.dirname(timed.details.results[0].sessionDir), { recursive: true, force: true });
+  calls = (await readFile(path.join(childCwd, "calls"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.equal(calls[0].env, "100"); assert.ok(calls[0].args.includes("parent/model")); assert.ok(calls[0].args.includes("high"));
+  assert.ok(calls.some(c => c.args.includes("override/model") && c.args.includes("low")));
+  assert.ok(calls.some(c => c.args.includes("--session")));
+  for (const call of calls) {
+    assert.ok(!call.args.includes("--tools")); assert.ok(!call.args.includes("bad/model"));
+    assert.doesNotMatch(call.prompt, /wrong prompt/); assert.notEqual(call.env, "7");
+  }
+  await assert.rejects(stat(path.join(cwd, "calls")), { code: "ENOENT" });
+  assert.equal(providerCalls, 0); assert.ok(events.some(e => e.data.agent === "general"));
+  const builtinBefore = await readFile(recordPath, "utf8");
+  const namedTools = new Map();
+  registerProfiles({ events: { emit() {} }, on() {}, registerCommand() {}, registerTool(tool) { namedTools.set(tool.name, tool); }, getThinkingLevel() { return "high"; } });
+  const namedTool = namedTools.get("subagent");
+  await assert.rejects(namedTool.execute("builtin", { ...params, cwd: childCwd, agent: "general" }, undefined, undefined, ctx), /cannot change profile/);
+  assert.equal(await readFile(recordPath, "utf8"), builtinBefore);
+  delete record.agents.role.builtin;
+  await writeFile(recordPath, JSON.stringify(record));
+  const generalBefore = await readFile(recordPath, "utf8");
+  await assert.rejects(execute(params), /Cannot resume a named-profile workflow/);
+  assert.equal(await readFile(recordPath, "utf8"), generalBefore);
+  record.agents.role.profile = "other"; await writeFile(recordPath, JSON.stringify(record));
+  const before = await readFile(recordPath, "utf8");
+  await assert.rejects(execute(params), /PI_SUBAGENT_PROFILES=1 or use a new workflow identity/);
+  assert.equal(await readFile(recordPath, "utf8"), before);
+  globalThis[agentProviders].set("named", () => [{ name: "other", description: "test", systemPrompt: "named prompt", model: "named/model", thinking: "low", tools: ["read"], maxTokens: 40 }]);
+  await assert.rejects(namedTool.execute("missing", { task: "x" }, undefined, undefined, ctx), /requires an agent name/);
+  await assert.rejects(namedTool.execute("unknown", { agent: "Other", task: "x" }, undefined, undefined, ctx), /Unknown agents: Other/);
+  let approvals = 0;
+  const untrusted = { ...ctx, hasUI: true, ui: { setWidget() {}, async confirm() { approvals++; return false; } } };
+  await assert.rejects(namedTool.execute("project", { agent: "general", agentScope: "project", task: "x" }, undefined, undefined, untrusted), /not approved/);
+  assert.equal(approvals, 1);
+  const named = await namedTool.execute("named", { ...params, cwd: childCwd, agent: "other" }, undefined, undefined, ctx);
+  assert.equal(named.details.results[0].status, "done");
+  const lastCall = (await readFile(path.join(childCwd, "calls"), "utf8")).trim().split("\n").map(JSON.parse).at(-1);
+  assert.ok(lastCall.args.includes("named/model")); assert.ok(lastCall.args.includes("low")); assert.ok(lastCall.args.includes("read")); assert.equal(lastCall.env, "40");
+  await execute({ action: "closeWorkflow", workflowId });
 });
 
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {

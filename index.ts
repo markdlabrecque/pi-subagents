@@ -74,7 +74,7 @@ interface ActiveTask extends TaskSpec {
 interface RunResult extends ActiveTask { exitCode: number; usage: { input: number; output: number; cost: number; turns: number }; }
 interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: RunResult[]; workflows?: WorkflowRecord[]; jobId?: string; }
 interface WorkflowAgentRecord {
-  workflowId: string; agentId: string; profile: string; sessionDir: string; sessionFile?: string;
+  workflowId: string; agentId: string; profile: string; builtin?: true; sessionDir: string; sessionFile?: string;
   status: Status; model?: string; thinking: ThinkingLevel; maxTokens?: number; cwd: string; createdAt: string; updatedAt: string;
   ownerId: string; lastTask?: string; lastResult?: string; reason?: string;
   /** Cumulative child execution only; idle time between workflow dispatches is separate. */
@@ -99,20 +99,25 @@ async function listWorkflows(workflowId?: string): Promise<WorkflowRecord[]> {
   return records.filter((r): r is WorkflowRecord => Boolean(r));
 }
 
-const TaskSchema = Type.Object({
-  agent: Type.String({ description: "Agent profile name" }),
+const legacyAgent = Type.Optional(Type.String({ description: "Deprecated: omit agent unless PI_SUBAGENT_PROFILES=1" }));
+const taskSchema = (profiles: boolean) => Type.Object({
+  agent: profiles ? Type.String({ description: "Exact agent profile name" }) : legacyAgent,
+  ...(!profiles ? {
+    agentScope: Type.Optional(Type.Unknown({ description: "Deprecated: profile mode only" })),
+    confirmProjectAgents: Type.Optional(Type.Unknown({ description: "Deprecated: profile mode only" })),
+  } : {}),
   task: Type.String({ description: "Specific delegated instruction" }),
   cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the parent cwd" })),
   model: Type.Optional(Type.String({ description: "Optional model override" })),
   thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
 });
-const Params = Type.Object({
+const paramsSchema = (profiles: boolean) => Type.Object({
   action: Type.Optional(Type.Enum(["run", "list", "cancel", "closeAgent", "closeWorkflow"] as const, { type: "string", default: "run" })),
   lifecycle: Type.Optional(Type.Enum(["terminal", "workflow"] as const, { type: "string", default: "terminal" })),
   workflowId: Type.Optional(Type.String({ description: "Stable workflow identifier for workflow lifecycle" })),
   agentId: Type.Optional(Type.String({ description: "Stable role identifier for workflow lifecycle" })),
-  agent: Type.Optional(Type.String()), task: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
+  agent: profiles ? Type.Optional(Type.String({ description: "Exact agent profile name" })) : legacyAgent, task: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
   model: Type.Optional(Type.String({ description: "Optional model override for single mode" })),
   thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
@@ -121,12 +126,16 @@ const Params = Type.Object({
   freshSession: Type.Optional(Type.Boolean({ description: "Start a fresh workflow child context instead of resuming its prior session" })),
   // Set only by a trusted workflow extension from its persisted role configuration.
   workflowMaxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Internal workflow role output-token limit" })),
-  tasks: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
-  chain: Type.Optional(Type.Array(TaskSchema, { maxItems: MAX_TASKS })),
-  agentScope: Type.Optional(Type.Enum(["user", "project", "both"] as const, { type: "string", default: "user" })),
-  confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
+  tasks: Type.Optional(Type.Array(taskSchema(profiles), { maxItems: MAX_TASKS })),
+  chain: Type.Optional(Type.Array(taskSchema(profiles), { maxItems: MAX_TASKS })),
+  agentScope: profiles ? Type.Optional(Type.Enum(["user", "project", "both"] as const, { type: "string", default: "user" })) : Type.Optional(Type.Unknown({ description: "Deprecated: profile mode only" })),
+  confirmProjectAgents: profiles ? Type.Optional(Type.Boolean({ default: true })) : Type.Optional(Type.Unknown({ description: "Deprecated: profile mode only" })),
   timeoutMinutes: Type.Optional(Type.Number({ minimum: 1, default: 30 })),
 });
+
+const Params = paramsSchema(false);
+const GENERAL: AgentConfig = { name: "general", description: "Built-in general-purpose agent", systemPrompt: "", source: "user", filePath: "builtin:general" };
+const MIGRATION_ERROR = "Named profiles are disabled. Omit agent and profile-only options for general-purpose delegation, or relaunch with PI_SUBAGENT_PROFILES=1 for managed workflows.";
 
 /** Content-free, best-effort metrics for one dispatch, including background runs.
  * No event is persisted by this extension; listeners must opt into recording.
@@ -204,6 +213,18 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 
 export default function (pi: ExtensionAPI) {
   if (process.env.PI_SUBAGENT_CHILD === "1") return;
+  const profiles = process.env.PI_SUBAGENT_PROFILES === "1";
+  const normalize = (params: Static<typeof Params>): TaskSpec[] => {
+    if (!profiles && (["agent", "agentScope", "confirmProjectAgents"].some(key => Object.hasOwn(params, key)) ||
+      [...(params.tasks ?? []), ...(params.chain ?? [])].some(item => ["agent", "agentScope", "confirmProjectAgents"].some(key => Object.hasOwn(item, key))))) throw new Error(MIGRATION_ERROR);
+    const single = params.task !== undefined ? [{ agent: params.agent, task: params.task, cwd: params.cwd, model: params.model, thinking: params.thinking, maxTokens: params.maxTokens }] : [];
+    const modes = Number(single.length > 0) + Number((params.tasks?.length ?? 0) > 0) + Number((params.chain?.length ?? 0) > 0);
+    if (modes !== 1) throw new Error("Provide exactly one mode: task, tasks, or chain.");
+    const specs = single.length ? single : params.tasks?.length ? params.tasks : params.chain!;
+    if (specs.length > MAX_TASKS) throw new Error(`Maximum ${MAX_TASKS} tasks`);
+    if (profiles && specs.some(s => !s.agent)) throw new Error("Named profile mode requires an agent name for every task.");
+    return specs.map(s => ({ ...s, agent: profiles ? s.agent! : GENERAL.name }));
+  };
   const active = new Map<string, ActiveTask>();
   const children = new Map<string, ReturnType<typeof spawn>>();
   const childExits = new Map<string, Promise<void>>();
@@ -300,14 +321,10 @@ export default function (pi: ExtensionAPI) {
   const runSubagent = async (params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: ((update: any) => void) | undefined, ctx: ExtensionContext, parentToolCallId?: string) => {
       const workflowLifecycle = params.lifecycle === "workflow";
       if (workflowLifecycle && (!params.workflowId || !params.agentId)) throw new Error("workflow lifecycle requires workflowId and agentId");
-      if (workflowLifecycle && (params.tasks?.length || params.chain?.length)) throw new Error("workflow lifecycle supports only agent+task; send one job at a time");
-      const scope: AgentScope = params.agentScope ?? "user";
-      const discovery = discoverAgents(ctx.cwd, scope); const agents = discovery.agents;
-      const single = params.agent && params.task ? [{ agent: params.agent, task: params.task, cwd: params.cwd, model: params.model, thinking: params.thinking, maxTokens: params.maxTokens }] : [];
-      const modes = Number(single.length > 0) + Number((params.tasks?.length ?? 0) > 0) + Number((params.chain?.length ?? 0) > 0);
-      if (modes !== 1) throw new Error(`Provide exactly one mode: agent+task, tasks, or chain. Available: ${agents.map(a => a.name).join(", ") || "none"}`);
-      const specs: TaskSpec[] = single.length ? single : params.tasks?.length ? params.tasks : params.chain!;
-      if (specs.length > MAX_TASKS) throw new Error(`Maximum ${MAX_TASKS} tasks`);
+      if (workflowLifecycle && (params.tasks?.length || params.chain?.length)) throw new Error("workflow lifecycle supports only a single task; send one job at a time");
+      const specs = normalize(params);
+      const scope: AgentScope = (params.agentScope as AgentScope | undefined) ?? "user";
+      const discovery = profiles ? discoverAgents(ctx.cwd, scope) : { agents: [GENERAL], projectAgentsDir: null }; const agents = discovery.agents;
       const requested = specs.map(s => agents.find(a => a.name === s.agent));
       const missing = specs.filter((_, i) => !requested[i]).map(s => s.agent);
       if (missing.length) throw new Error(`Unknown agents: ${missing.join(", ")}. Available: ${agents.map(a => a.name).join(", ") || "none"}`);
@@ -344,22 +361,29 @@ export default function (pi: ExtensionAPI) {
         active.set(id, state); updateWidget();
         // Fresh reviewers get a new directory/context. The running-run guard above
         // makes this reset safe: it never deletes a live persisted session.
+        const validateIdentity = (prior: WorkflowAgentRecord | undefined) => {
+          if (!prior) return;
+          if (!profiles && (prior.profile !== agent.name || prior.builtin !== true)) throw new Error("Cannot resume a named-profile workflow as general-purpose. Relaunch with PI_SUBAGENT_PROFILES=1 or use a new workflow identity.");
+          if ((profiles && prior.builtin === true) || prior.profile !== agent.name || prior.cwd !== path.resolve(spec.cwd ?? ctx.cwd)) throw new Error("A workflow agent cannot change profile or working directory when resumed");
+        };
+        if (workflowLifecycle) validateIdentity((await readWorkflow(params.workflowId!))?.agents[params.agentId!]);
         const sessionDir = workflowLifecycle ? path.join(runDir, `session-${safeId(params.agentId!)}${params.freshSession ? `-${crypto.randomUUID()}` : ""}`) : path.join(runDir, `session-${index + 1}`);
         await fs.promises.mkdir(sessionDir, { recursive: true });
         let workflow: WorkflowRecord | undefined;
         let existing: WorkflowAgentRecord | undefined;
-        state.status = "running"; state.startedAt = Date.now(); workflowStartedAt = state.startedAt; state.sessionDir = sessionDir; updateWidget();
+        state.status = "running"; state.startedAt = Date.now(); state.sessionDir = sessionDir; updateWidget();
         if (workflowLifecycle) {
           await mutateWorkflow(params.workflowId!, async () => {
             workflow = await readWorkflow(params.workflowId!);
             existing = workflow?.agents[params.agentId!];
-            if (existing && (existing.profile !== agent.name || existing.cwd !== path.resolve(spec.cwd ?? ctx.cwd))) throw new Error("A workflow agent cannot change profile or working directory when resumed");
+            validateIdentity(existing);
+            workflowStartedAt = state.startedAt;
             const now = new Date().toISOString();
             workflow ??= { workflowId: params.workflowId!, runDir, agents: {}, createdAt: now, updatedAt: now };
             const selectedModel = spec.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
             const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens }), modelMaxTokens(ctx, selectedModel));
             const idleWaitingMs = (existing?.idleWaitingMs ?? 0) + (existing?.lastEndedAt ? Math.max(0, Date.now() - Date.parse(existing.lastEndedAt)) : 0);
-            workflow.agents[params.agentId!] = { workflowId: params.workflowId!, agentId: params.agentId!, profile: agent.name, sessionDir,
+            workflow.agents[params.agentId!] = { workflowId: params.workflowId!, agentId: params.agentId!, profile: agent.name, ...(!profiles ? { builtin: true as const } : {}), sessionDir,
               sessionFile: params.freshSession ? undefined : existing?.sessionFile, status: "running", model: spec.model ?? agent.model, thinking: spec.thinking ?? agent.thinking ?? pi.getThinkingLevel(), maxTokens,
               cwd: path.resolve(spec.cwd ?? ctx.cwd), createdAt: existing?.createdAt ?? now, updatedAt: now, ownerId: id, lastTask: task, lastResult: existing?.lastResult,
               activeRunMs: existing?.activeRunMs ?? 0, idleWaitingMs }; 
@@ -502,8 +526,8 @@ export default function (pi: ExtensionAPI) {
 
   const startBackground = (params: Static<typeof Params>, ctx: ExtensionContext, parentToolCallId?: string) => {
     // One job covers the whole call: a parallel batch or chain is cancelled and reported as a unit.
-    const specs = params.tasks?.length ? params.tasks : params.chain?.length ? params.chain : params.agent && params.task ? [{ agent: params.agent, task: params.task }] : [];
-    if (!specs.length) throw new Error("background needs agent+task, tasks, or chain");
+    const specs = normalize(params);
+    if (params.lifecycle === "workflow" && (!params.workflowId || !params.agentId || params.tasks?.length || params.chain?.length)) throw new Error("workflow lifecycle requires workflowId, agentId and a single task");
     const agent = params.tasks?.length ? `parallel: ${specs.map(s => s.agent).join(", ")}` : params.chain?.length ? `chain: ${specs.map(s => s.agent).join(" → ")}` : specs[0].agent;
     const jobId = `bg-${++backgroundSeq}`;
     const job = { controller: new AbortController(), agent, task: specs[0].task, startedAt: Date.now(), cancelled: false };
@@ -521,7 +545,7 @@ export default function (pi: ExtensionAPI) {
       details: { mode: "single", results: [], jobId } as Details };
   };
 
-  pi.registerTool({
+  if (profiles) pi.registerTool({
     name: "list_agent_profiles", label: "Agent profiles",
     description: "List agent profiles currently discoverable by the subagent extension, including their source, description, model, thinking level, and tool restrictions.",
     promptSnippet: "List profiles available to the subagent tool",
@@ -545,17 +569,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "subagent", label: "Subagent",
-    description: `Delegate isolated work to user agents in ${path.join(getAgentDir(), "agents")}. Default to single mode. Use tasks only when parallel execution is explicitly requested. Child sessions use normal Pi context and compaction rules, are removed on success, and retained for 24 hours on failure. Maximum ${MAX_TASKS} tasks, ${MAX_CONCURRENCY} concurrent, 30 minute default timeout.`,
+    description: `${profiles ? "Delegate to an exact named profile; use list_agent_profiles for discovery." : "Delegate a task to the built-in general-purpose agent; no profile is needed."} Default to single mode. Use tasks only when parallel execution is explicitly requested. Child sessions use normal Pi context and compaction rules, are removed on success, and retained for 24 hours on failure. Maximum ${MAX_TASKS} tasks, ${MAX_CONCURRENCY} concurrent, 30 minute default timeout.`,
     promptSnippet: "Delegate isolated tasks to one or more subagents",
     promptGuidelines: [
+      profiles ? "Use list_agent_profiles to discover exact profile names for subagent." : "Use subagent with a task alone; it runs the built-in general-purpose agent.",
       "Use subagent in single mode unless the user explicitly requests parallel agents.",
       "Do not delegate trivial work; use subagent for bounded tasks benefiting from isolated context.",
       "Subagents cannot create other subagents. Callers must serialize writing stages in an isolated worktree; parallel same-worktree mutation is unsafe.",
       "Set background: true (any mode) to keep working while the subagent runs; its result arrives later as a follow-up message, so do not poll for it.",
     ],
-    parameters: Params,
+    parameters: paramsSchema(profiles),
     async execute(_id, params, signal, onUpdate, ctx) {
       widgetCtx = ctx;
+      if (!profiles && (["agent", "agentScope", "confirmProjectAgents"].some(key => Object.hasOwn(params, key)) || [...(params.tasks ?? []), ...(params.chain ?? [])].some(item => ["agent", "agentScope", "confirmProjectAgents"].some(key => Object.hasOwn(item, key))))) throw new Error(MIGRATION_ERROR);
       const action = params.action ?? "run";
       if (action === "list") {
         const workflows = await listWorkflows(params.workflowId);
@@ -608,7 +634,7 @@ export default function (pi: ExtensionAPI) {
       if (params.background) return startBackground(params, ctx, _id);
       return runSubagent(params, signal, onUpdate, ctx, _id);
     },
-    renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? "single" : `${count} agents`) + (args.background ? theme.fg("muted", " (background)") : ""), 0, 0); },
+    renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? (profiles ? "single" : "general") : `${count} agents`) + (args.background ? theme.fg("muted", " (background)") : ""), 0, 0); },
     renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); if (d.jobId) return new Text(theme.fg("muted", d.mode === "management" ? `cancelling ${d.jobId}` : `started ${d.jobId} in background`), 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}`).join("\n"), 0, 0); },
   });
 }

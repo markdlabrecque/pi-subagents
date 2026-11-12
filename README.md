@@ -1,25 +1,25 @@
 # Subagent extension
 
-Delegates bounded tasks to isolated Pi subprocesses. Child agents inherit the parent's current model, thinking level, working directory, context-file discovery, extensions, and normal compaction behavior unless an agent profile or tool call overrides the model.
+Delegates bounded tasks to isolated Pi subprocesses. Ordinary calls use a built-in general-purpose agent and need no profile files. Children inherit the parent's model, thinking level, working directory, context-file discovery, extensions and normal compaction behavior. Calls can override model, thinking, cwd, timeout and output limit.
 
 ## Usage
 
 Ask naturally, for example:
 
-- `Use the worker subagent to implement the parser change.`
-- `Run two scouts in parallel: one for API routing and one for tests.`
-- `Use a chain: scout the code, then have planner create a plan using {previous}.`
+- `Delegate the parser change to a subagent.`
+- `Run two subagents in parallel: one for API routing and one for tests.`
+- `Use a chain: investigate the code, then plan using {previous}.`
 
 The parent model calls `subagent` in one of these modes:
 
 ```ts
-{ agent: "worker", task: "Implement ..." }
-{ tasks: [{ agent: "scout", task: "Find ..." }, { agent: "reviewer", task: "Review ..." }] }
-{ chain: [{ agent: "scout", task: "Investigate ..." }, { agent: "planner", task: "Plan from: {previous}" }] }
+{ task: "Implement ..." }
+{ tasks: [{ task: "Find ..." }, { task: "Review ..." }] }
+{ chain: [{ task: "Investigate ..." }, { task: "Plan from: {previous}" }] }
 
 // Persistent role session
-{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", agent: "implementer", task: "Implement ..." }
-{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "reviewer", agent: "reviewer", freshSession: true, task: "Review ..." }
+{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", task: "Implement ..." }
+{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "reviewer", freshSession: true, task: "Review ..." }
 { action: "list", workflowId: "workflow-123" }
 { action: "closeAgent", workflowId: "workflow-123", agentId: "implementer" }
 { action: "closeWorkflow", workflowId: "workflow-123" }
@@ -30,8 +30,8 @@ The parent model calls `subagent` in one of these modes:
 Single, parallel (`tasks`), and chain calls accept `background: true`. The tool returns a job id at once, so the parent can keep working or answer the user. One job covers the whole call: cancelling it stops every child in the batch or chain, and once the last child ends, the combined result is posted to the session as a `subagent-background-result` follow-up message that wakes the parent.
 
 ```ts
-{ agent: "reviewer", task: "Review ...", background: true }   // -> "Started background subagent bg-1 ..."
-{ tasks: [{ agent: "scout", task: "..." }, { agent: "reviewer", task: "..." }], background: true }   // one job, bg-2
+{ task: "Review ...", background: true }   // -> "Started background subagent bg-1 ..."
+{ tasks: [{ task: "..." }, { task: "..." }], background: true }   // one job, bg-2
 { action: "list" }                                            // shows running background jobs
 { action: "cancel", jobId: "bg-1" }                           // stops it; the cancel notice does not wake the parent
 ```
@@ -42,7 +42,18 @@ Background runs need a long-lived session (interactive or RPC). In print mode (`
 
 Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, 30 minutes per child, and 50 KB of model-visible output per child.
 
-## Agent profiles
+## Managed workflows: named profiles
+
+This is a breaking tool-contract change. To retain named profiles, set `PI_SUBAGENT_PROFILES=1` in the launching process and relaunch Pi. Only the exact value `1` enables them; changing the environment after registration does not change the running session. Factory's owner must update and verify its launcher before Factory adopts this version. This extension does not change Factory.
+
+In ordinary sessions, remove `agent`, `agentScope` and `confirmProjectAgents` from calls, including entries in `tasks` and `chain`. These legacy fields are rejected rather than ignored. For example, change `{ agent: "worker", task: "Implement ..." }` to `{ task: "Implement ..." }`. A workflow's `agentId` remains its stable role identifier, not a profile selector. Existing named-profile workflow sessions cannot be resumed as general-purpose: relaunch with profiles enabled or use a new workflow identity. You can still list or close them in ordinary mode. No profile files or workflow data need deletion.
+
+In profile-enabled sessions, select exact names for every task:
+
+```ts
+{ agent: "worker", task: "Implement ..." }
+{ lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", agent: "worker", task: "Implement ..." }
+```
 
 Use the `list_agent_profiles` tool to see profiles currently discoverable by the extension, including their source and configuration. It accepts `agentScope: "user"` (default), `"project"`, or `"both"`; project-local profiles are listed but are still subject to confirmation when launched.
 
