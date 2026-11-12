@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -126,6 +127,43 @@ const Params = Type.Object({
   confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
   timeoutMinutes: Type.Optional(Type.Number({ minimum: 1, default: 30 })),
 });
+
+/** Content-free, best-effort metrics for one dispatch, including background runs.
+ * No event is persisted by this extension; listeners must opt into recording.
+ */
+export function createChildMetrics(emit: (name: string, data: unknown) => void, parentToolCallId?: string, taskIndex = 0) {
+  const runId = crypto.randomUUID(), startedAt = Date.now(), started = performance.now();
+  const keys = ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"] as const;
+  const totals = Object.fromEntries(keys.map(key => [key, 0]));
+  const known = Object.fromEntries(keys.map(key => [key, 0]));
+  let turns = 0, finished = false, provider: string | null = null, model: string | null = null, lastStopReason: string | null = null;
+  let consistentModel = true, consistentProvider = true;
+  const safeLabel = (value: unknown) => typeof value === "string" && /^[a-zA-Z0-9_.:/-]{1,256}$/.test(value) ? value : null;
+  const safeToolId = (value: unknown) => typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value) ? value : null;
+  const send = (name: string, data: unknown) => { try { emit(name, data); } catch { /* Never change child outcomes. */ } };
+  send("subagents:metrics-start/v1", { runId, parentToolCallId: safeToolId(parentToolCallId), taskIndex });
+  return {
+    observe(message: any) {
+      if (message?.role !== "assistant" || finished) return;
+      const nextProvider = safeLabel(message.provider), nextModel = safeLabel(message.model);
+      if (turns === 0) { model = nextModel; provider = nextProvider; }
+      else { consistentModel &&= model === nextModel; consistentProvider &&= provider === nextProvider; }
+      turns++; lastStopReason = message.stopReason;
+      for (const key of keys) {
+        const value = key === "cost" ? message.usage?.cost?.total : message.usage?.[key];
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) { totals[key] += value; known[key]++; }
+      }
+    },
+    finish(state: { status: string; agent: string; modelUsed?: string }, failed = false) {
+      if (finished) return;
+      finished = true;
+      const outcome = failed ? "failed" : lastStopReason === "aborted" ? "aborted" : ["done", "failed", "aborted"].includes(state.status) ? state.status : "failed";
+      send("subagents:metrics-end/v1", { runId, parentToolCallId: safeToolId(parentToolCallId), taskIndex, startedAt, endedAt: Date.now(),
+        elapsedMs: Math.max(0, performance.now() - started), agent: safeLabel(state.agent), model: consistentModel ? model : null, provider: consistentProvider ? provider : null, outcome, turns,
+        usage: Object.fromEntries(keys.map(key => [key, turns > 0 && known[key] === turns ? totals[key] : null])) });
+    },
+  };
+}
 
 function trimOutput(text: string): string {
   if (Buffer.byteLength(text) <= OUTPUT_CAP) return text;
@@ -259,7 +297,7 @@ export default function (pi: ExtensionAPI) {
     return closing;
   };
 
-  const runSubagent = async (params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: ((update: any) => void) | undefined, ctx: ExtensionContext) => {
+  const runSubagent = async (params: Static<typeof Params>, signal: AbortSignal | undefined, onUpdate: ((update: any) => void) | undefined, ctx: ExtensionContext, parentToolCallId?: string) => {
       const workflowLifecycle = params.lifecycle === "workflow";
       if (workflowLifecycle && (!params.workflowId || !params.agentId)) throw new Error("workflow lifecycle requires workflowId and agentId");
       if (workflowLifecycle && (params.tasks?.length || params.chain?.length)) throw new Error("workflow lifecycle supports only agent+task; send one job at a time");
@@ -300,6 +338,9 @@ export default function (pi: ExtensionAPI) {
         const id = workflowLifecycle ? `${safeId(params.workflowId!)}:${safeId(params.agentId!)}` : `${runId}-${index + 1}`;
         const task = prior ? spec.task.replace(/\{previous\}/g, prior) : spec.task;
         const state: ActiveTask = { ...spec, task, id, status: "queued", contextTokens: 0, workflowId: workflowLifecycle ? params.workflowId : undefined, agentId: workflowLifecycle ? params.agentId : undefined };
+        const metrics = createChildMetrics((name, data) => pi.events.emit(name, data), parentToolCallId, index);
+        let completedSuccessfully = false;
+        try {
         active.set(id, state); updateWidget();
         // Fresh reviewers get a new directory/context. The running-run guard above
         // makes this reset safe: it never deletes a live persisted session.
@@ -365,6 +406,7 @@ export default function (pi: ExtensionAPI) {
             if (e.type === "tool_execution_end") { state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget(); }
             if (e.type === "message_end" && e.message) {
               messages.push(e.message);
+              metrics.observe(e.message);
               if (e.message.role === "assistant") { const u = e.message.usage; usage.turns++; usage.input += u?.input ?? 0; usage.output += u?.output ?? 0; usage.cost += u?.cost?.total ?? 0; state.contextTokens = u?.totalTokens ?? 0; state.modelUsed = e.message.model; stopReason = e.message.stopReason ?? stopReason; errorMessage = e.message.errorMessage ?? errorMessage; }
               onUpdate?.({ content: [{ type: "text", text: finalText(messages) || `${agent.name} is working...` }], details: { mode: "single", results: [] } }); updateWidget();
             }
@@ -387,7 +429,12 @@ export default function (pi: ExtensionAPI) {
             await writeWorkflow(workflow);
           }
         });
+        completedSuccessfully = true;
         return { ...state, exitCode, usage };
+        } finally {
+          // Final persistence can throw after the subprocess already set status=done.
+          metrics.finish(state, !completedSuccessfully);
+        }
       };
 
       let results: RunResult[] = [];
@@ -453,7 +500,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  const startBackground = (params: Static<typeof Params>, ctx: ExtensionContext) => {
+  const startBackground = (params: Static<typeof Params>, ctx: ExtensionContext, parentToolCallId?: string) => {
     // One job covers the whole call: a parallel batch or chain is cancelled and reported as a unit.
     const specs = params.tasks?.length ? params.tasks : params.chain?.length ? params.chain : params.agent && params.task ? [{ agent: params.agent, task: params.task }] : [];
     if (!specs.length) throw new Error("background needs agent+task, tasks, or chain");
@@ -461,7 +508,7 @@ export default function (pi: ExtensionAPI) {
     const jobId = `bg-${++backgroundSeq}`;
     const job = { controller: new AbortController(), agent, task: specs[0].task, startedAt: Date.now(), cancelled: false };
     backgroundJobs.set(jobId, job);
-    void runSubagent({ ...params, background: undefined }, job.controller.signal, undefined, ctx).then(
+    void runSubagent({ ...params, background: undefined }, job.controller.signal, undefined, ctx, parentToolCallId).then(
       result => result.content.map(c => c.text).join("\n"),
       (error: any) => `Background subagent failed: ${error?.message ?? String(error)}`,
     ).then(text => {
@@ -558,8 +605,8 @@ export default function (pi: ExtensionAPI) {
         const text = await closeWorkflow(params.workflowId);
         return { content: [{ type: "text", text }], details: { mode: "management", results: [] } as Details };
       }
-      if (params.background) return startBackground(params, ctx);
-      return runSubagent(params, signal, onUpdate, ctx);
+      if (params.background) return startBackground(params, ctx, _id);
+      return runSubagent(params, signal, onUpdate, ctx, _id);
     },
     renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? "single" : `${count} agents`) + (args.background ? theme.fg("muted", " (background)") : ""), 0, 0); },
     renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); if (d.jobId) return new Text(theme.fg("muted", d.mode === "management" ? `cancelling ${d.jobId}` : `started ${d.jobId} in background`), 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}`).join("\n"), 0, 0); },
