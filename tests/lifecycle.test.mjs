@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync, readFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
+import { once } from "node:events";
+import { createInterface } from "node:readline";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-const inheritedChildEnv = Object.fromEntries(["PI_SUBAGENT_CHILD", "PI_WORKFLOW_ID", "PI_WORKFLOW_ROLE"].map(key => [key, process.env[key]]));
+const inheritedChildEnv = Object.fromEntries(["PI_SUBAGENT_CHILD", "PI_WORKFLOW_ID", "PI_WORKFLOW_ROLE", ...Object.keys(process.env).filter(key => key.startsWith("HERDR_"))].map(key => [key, process.env[key]]));
 for (const key of Object.keys(inheritedChildEnv)) delete process.env[key];
 test.after(() => { for (const [key, value] of Object.entries(inheritedChildEnv)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
 const root = path.resolve(import.meta.dirname, "..");
@@ -383,23 +386,8 @@ test("child max-token override clamps runtime models and terminal calls stay unc
   assert.equal(subagentModule.resolveMaxTokens({}), undefined, "terminal calls without a profile or per-call limit preserve model defaults");
 });
 
-test("cleanup and failure retention are explicit", () => {
+test("failed runs have a 24-hour retention window", () => {
   assert.match(index, /FAILED_RETENTION_MS = 24 \* 60 \* 60_000/);
-  assert.match(index, /failed-\$\{Date\.now\(\)\}/);
-  assert.match(index, /children.*SIGTERM/s);
-  assert.match(index, /SIGKILL/);
-  assert.match(index, /const closeWorkflow = \(workflowId: string\): Promise<string> =>/);
-  assert.match(index, /await Promise\.all\(exits\)/);
-  assert.match(index, /filter\(a => a\.status === "done"\).*fs\.promises\.rm/s);
-  assert.match(index, /await fs\.promises\.utimes\(retained, new Date\(\), new Date\(\)\)/);
-  assert.match(index, /const text = await closeWorkflow\(params\.workflowId\)/);
-  assert.match(index, /workflowRuns\.has\(workflowRunId\)/);
-  assert.match(index, /closingWorkflowRequests\.get\(workflowId\)/);
-  assert.match(index, /await Promise\.all\(exits\);\s+workflow = await readWorkflow\(workflowId\)/s);
-  assert.match(index, /closingAgents\.has\(ownerId\)/);
-  assert.match(index, /await Promise\.all\(\[exit, run\]/);
-  assert.match(index, /failed-\$\{Date\.now\(\)\}-\$\{safeId\(params\.workflowId!\)\}-\$\{safeId\(params\.agentId!\)\}/);
-  assert.match(index, /await mutateWorkflow\(params\.workflowId!/);
 });
 
 test("agent widget has no development-workflow telemetry", () => {
@@ -845,6 +833,286 @@ test("built-in dispatch runs all modes and preserves workflow identity", async t
   const lastCall = (await readFile(path.join(childCwd, "calls"), "utf8")).trim().split("\n").map(JSON.parse).at(-1);
   assert.ok(lastCall.args.includes("named/model")); assert.ok(lastCall.args.includes("low")); assert.ok(lastCall.args.includes("read")); assert.equal(lastCall.env, "40");
   await execute({ action: "closeWorkflow", workflowId });
+});
+
+async function herdrFixture(t, options = {}) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "pi-herdr-test-"));
+  const cwd = path.join(dir, "worker ' cwd");
+  await mkdir(cwd);
+  const script = path.join(dir, "worker.cjs"), socket = path.join(dir, "herdr.sock");
+  await writeFile(script, `const fs = require('node:fs'), path = require('node:path');
+const args = process.argv.slice(2), env = process.env;
+const param = k => args[args.indexOf(k) + 1];
+const task = args.at(-1).slice(6);
+fs.appendFileSync(path.join(process.cwd(), 'calls'), JSON.stringify({ args, cwd: process.cwd(), pane: env.HERDR_PANE_ID, tab: env.HERDR_TAB_ID,
+  child: env.PI_SUBAGENT_CHILD, maxTokens: env.PI_SUBAGENT_MAX_TOKENS, workflow: env.PI_WORKFLOW_ID, role: env.PI_WORKFLOW_ROLE,
+  prompt: fs.readFileSync(param('--append-system-prompt'), 'utf8') }) + '\\n');
+fs.writeFileSync(path.join(param('--session-dir'), 'session.jsonl'), 'stub session');
+console.log(JSON.stringify({ type: 'tool_execution_start', toolName: 'read' }));
+if (task === 'fail') { console.error('stub diagnostic'); process.exitCode = 7; }
+else if (task === 'lose runner') process.kill(process.ppid, 'SIGKILL');
+else if (task === 'hold') setInterval(() => {}, 1000);
+else console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'stub result' }], model: 'stub', usage: { output: 3 }, stopReason: 'stop' } }));`);
+  const parent = { workspace_id: "work", tab_id: "parent-tab", pane_id: "parent-pane" };
+  const requests = [], owned = [], closed = [], tabs = new Map(), results = [], events = [], hooks = new Map();
+  const live = new Set(), children = new Set();
+  const server = createServer(peer => {
+    live.add(peer); peer.on("close", () => live.delete(peer)); peer.on("error", () => {});
+    createInterface({ input: peer }).on("line", raw => {
+      const request = JSON.parse(raw); requests.push(request);
+      const { id, method, params } = request;
+      const send = body => peer.write(JSON.stringify({ id, ...body }) + "\n");
+      const missing = () => send({ error: { code: "tab_not_found", message: "No such tab" } });
+      if (method === "pane.get") return send({ result: { type: "pane_info", pane: parent } });
+      if (method === "tab.list") return send({ result: { type: "tab_list", tabs: [...tabs.values()].map(({ tab_id, workspace_id, label }) => ({ tab_id, workspace_id, label })) } });
+      if (method === "tab.get") return tabs.has(params.tab_id) ? send({ result: { type: "tab_info" } }) : missing();
+      if (method === "tab.close") {
+        const tab = tabs.get(params.tab_id);
+        if (!tab) return missing();
+        if (options.rejectClose) return send({ error: { code: "tab_close_failed", message: "fixture refused close" } });
+        close(tab);
+        if (options.loseCloseReply) return peer.end();
+        return send({ result: { type: "ok" } });
+      }
+      if (method !== "layout.apply") return send({ error: { code: "unexpected", message: method } });
+      if (options.rejectLaunch) return send({ error: { code: "layout_apply_failed", message: "fixture refused launch" } });
+      const tab = { tab_id: `worker-tab-${owned.length}`, pane_id: `worker-pane-${owned.length}`, workspace_id: "work", label: params.tab_label };
+      owned.push(tab); tabs.set(tab.tab_id, tab);
+      if (params.root?.command) {
+        const [command, ...argv] = params.root.command;
+        // Deliberately use the server's environment, not the supervisor's.
+        tab.process = spawn(command, argv, { cwd: params.root.cwd, env: { PATH: process.env.PATH, HERDR_SOCKET_PATH: socket,
+          HERDR_ENV: "1", HERDR_WORKSPACE_ID: "work", HERDR_TAB_ID: tab.tab_id, HERDR_PANE_ID: tab.pane_id, ...params.root.env }, stdio: ["ignore", "pipe", "pipe"] });
+        children.add(tab.process); tab.done = once(tab.process, "close"); tab.done.finally(() => children.delete(tab.process));
+        tab.screen = ""; tab.process.stdout.on("data", data => { tab.screen += data; });
+        tab.process.stderr.resume();
+      }
+      if (options.loseLaunchReply) return peer.end();
+      send({ result: { type: "layout_apply", layout: { workspace_id: "work", tab_id: tab.tab_id, focused_pane_id: tab.pane_id, root: { type: "pane", pane_id: tab.pane_id } } } });
+    });
+  });
+  function close(tab) { closed.push(tab.tab_id); tabs.delete(tab.tab_id); tab.process?.kill("SIGHUP"); }
+  server.listen(socket); await once(server, "listening");
+  const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: socket, HERDR_WORKSPACE_ID: "work", HERDR_PANE_ID: "parent-pane", HERDR_TAB_ID: "parent-tab" };
+  const saved = new Map([...Object.keys(env), "PI_SUBAGENT_PROFILES"].map(key => [key, process.env[key]]));
+  const priorScript = process.argv[1]; process.argv[1] = script;
+  delete process.env.PI_SUBAGENT_PROFILES;
+  if (!options.headless) Object.assign(process.env, env);
+  t.after(async () => {
+    process.argv[1] = priorScript;
+    for (const [key, value] of saved) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    for (const child of children) child.kill("SIGHUP");
+    await Promise.all(owned.map(tab => tab.done));
+    for (const peer of live) peer.destroy();
+    await new Promise(resolve => server.close(resolve));
+    for (const { sessionDir } of results) if (sessionDir?.startsWith(path.join(os.tmpdir(), "pi-subagents") + path.sep)) await rm(path.dirname(sessionDir), { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
+  });
+  let tool, deliver, ready;
+  const messages = [], delivered = new Promise(resolve => { deliver = resolve; });
+  const workerReady = new Promise(resolve => { ready = resolve; });
+  subagentModule.default({ registerTool(value) { tool = value; }, registerCommand() {}, getThinkingLevel() { return "medium"; },
+    events: { emit(name, data) { events.push({ name, data }); if (name === "pi:activity/v1" && data.progress?.label === "read") ready(); } }, on(name, handler) { hooks.set(name, handler); },
+    sendMessage(message, options) { messages.push({ message, options }); deliver(); } });
+  const ctx = { cwd: dir, hasUI: false, ui: {}, modelRegistry: { find() { return { maxTokens: 100 }; } }, sessionManager: { getSessionId() { return "herdr-test-parent"; } } };
+  const execute = async (params, signal, update) => {
+    const result = await tool.execute("herdr-test", { cwd, ...params }, signal, update, ctx);
+    results.push(...result.details.results);
+    return result;
+  };
+  const calls = async () => (await readFile(path.join(cwd, "calls"), "utf8").catch(error => { if (error.code !== "ENOENT") throw error; return ""; })).trim().split("\n").filter(Boolean).map(JSON.parse);
+  return { cwd, execute, calls, requests, tabs, owned, closed, close, messages, delivered, events, hooks, workerReady };
+}
+
+test("Herdr runs each parallel worker in its own unfocused tab and returns results after cleanup", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const text = `literal ' \" $HOME $(echo never)\nsecond line`;
+  const result = await f.execute({ tasks: [{ cwd: f.cwd, task: text, model: "stub/model", thinking: "high", maxTokens: 200 }, { cwd: f.cwd, task: "fail" }] });
+  const launches = f.requests.filter(r => r.method === "layout.apply");
+  assert.equal(launches.length, 2);
+  for (const { params } of launches) {
+    assert.equal(params.focus, false);
+    assert.equal(params.workspace_id, "work");
+    assert.equal(params.root.cwd, f.cwd);
+    assert.ok(params.root.command.every(value => typeof value === "string"));
+  }
+  assert.equal(new Set(f.owned.map(tab => tab.tab_id)).size, 2);
+  assert.deepEqual([...f.closed].sort(), f.owned.map(tab => tab.tab_id).sort());
+  const calls = await f.calls();
+  for (const tab of f.owned) assert.ok(calls.some(call => call.pane === tab.pane_id && call.tab === tab.tab_id));
+  const call = calls.find(call => call.args.at(-1) === `Task: ${text}`);
+  assert.ok(call);
+  assert.equal(call.cwd, f.cwd); assert.equal(call.child, "1"); assert.equal(call.maxTokens, "100");
+  assert.deepEqual(call.args.slice(0, 3), ["--mode", "json", "-p"]);
+  assert.ok(call.args.includes("stub/model") && call.args.includes("high"));
+  assert.ok(call.args.some(arg => arg.endsWith("/child-guard.ts")));
+  assert.match(call.prompt, /You cannot delegate/);
+  assert.match(f.owned.map(tab => tab.screen).join("\n"), /read/);
+  assert.equal(result.details.results[0].output, "stub result");
+  assert.equal(result.details.results[1].exitCode, 7);
+  assert.match(result.content[0].text, /stub diagnostic/);
+  assert.equal(f.events.filter(e => e.name === "subagents:metrics-end/v1").length, 2);
+});
+
+test("a lost Herdr close reply is reconciled without calling the worker a failure", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t, { loseCloseReply: true });
+  const result = await f.execute({ task: "one-shot" });
+  assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+  assert.equal(result.details.results[0].status, "done");
+  assert.equal(result.details.results[0].cleanupWarning, undefined);
+});
+
+test("an ambiguous Herdr allocation is reconciled without ever starting a worker", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t, { loseLaunchReply: true });
+  f.tabs.set("unrelated", { tab_id: "unrelated", workspace_id: "work", label: "Pi subagent another run" });
+  const result = await f.execute({ task: "must not run" });
+  assert.equal(result.details.results[0].status, "failed");
+  assert.match(result.content[0].text, /layout\.apply disconnected/);
+  assert.equal(f.owned.length, 1);
+  assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+  assert.deepEqual([...f.tabs.keys()], ["unrelated"]);
+  assert.deepEqual(await f.calls(), []);
+});
+
+test("Herdr launch rejection never falls back to a headless worker", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t, { rejectLaunch: true });
+  const result = await f.execute({ task: "must not run" });
+  assert.equal(result.details.results[0].status, "failed");
+  assert.match(result.content[0].text, /fixture refused launch/);
+  assert.deepEqual(await f.calls(), []);
+});
+
+test("a Herdr cleanup error is separate from a successful worker result", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t, { rejectClose: true });
+  const result = await f.execute({ task: "one-shot" });
+  assert.equal(result.details.results[0].status, "done");
+  assert.equal(result.details.results[0].output, "stub result");
+  assert.match(result.details.results[0].cleanupWarning, /fixture refused close/);
+  assert.match(result.content[0].text, /Warning: Herdr tab cleanup/);
+  assert.equal((await f.calls()).length, 1);
+});
+
+test("outside Herdr a worker produces the same result without a socket request", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t, { headless: true });
+  const result = await f.execute({ task: "headless" });
+  assert.deepEqual(f.requests, []);
+  assert.equal(result.details.results[0].output, "stub result");
+  assert.equal((await f.calls())[0].pane, undefined);
+});
+
+for (const cause of ["timeout", "parent abort", "manual close", "session shutdown", "closeAgent", "closeWorkflow"]) {
+  test(`Herdr ${cause} settles the worker and leaves no tab`, { timeout: 10000 }, async t => {
+    const f = await herdrFixture(t);
+    const controller = new AbortController();
+    if (cause === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
+    const workflow = { lifecycle: "workflow", workflowId: `herdr-${process.pid}-${cause}`, agentId: "role" };
+    const isWorkflowClose = cause === "closeAgent" || cause === "closeWorkflow";
+    const pending = f.execute({ task: "hold", timeoutMinutes: 1, ...(isWorkflowClose ? workflow : {}) }, controller.signal);
+    await f.workerReady;
+    const before = f.events.filter(e => e.name === "subagents:metrics-end/v1");
+    assert.equal(before.length, 0, "a live worker has not completed");
+    let closing;
+    if (cause === "timeout") t.mock.timers.tick(60_000);
+    if (cause === "parent abort") controller.abort();
+    if (cause === "manual close") f.close(f.owned[0]);
+    if (cause === "session shutdown") closing = f.hooks.get("session_shutdown")();
+    if (isWorkflowClose) closing = f.execute({ action: cause, workflowId: workflow.workflowId, agentId: workflow.agentId });
+    const result = await pending;
+    await closing;
+    const child = result.details.results[0];
+    assert.equal(child.status, ["timeout", "manual close"].includes(cause) ? "failed" : "aborted");
+    assert.match(child.reason, new RegExp(({ timeout: "Timed out", "parent abort": "Aborted by parent", "manual close": "interrupted|channel closed", "session shutdown": "Parent session shut down", closeAgent: "Agent closed", closeWorkflow: "Workflow closed" })[cause]));
+    assert.equal(child.cleanupWarning, undefined);
+    assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+    assert.equal(f.events.filter(e => e.name === "subagents:metrics-end/v1").length, 1);
+    if (isWorkflowClose) {
+      // Management relocates failed diagnostics; remove just this fixture's artifacts.
+      t.after(async () => {
+        for (const name of await readdir(path.join(os.tmpdir(), "pi-subagents"))) {
+          if (name.startsWith("failed-") && (name.endsWith(workflow.workflowId) || name.endsWith(`${workflow.workflowId}-role`))) await rm(path.join(os.tmpdir(), "pi-subagents", name), { recursive: true, force: true });
+        }
+      });
+      if (cause === "closeAgent") await f.execute({ action: "closeWorkflow", workflowId: workflow.workflowId });
+    }
+  });
+}
+
+test("Herdr background cancellation returns early and delivers exactly one follow-up after the tab closes", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const started = await f.execute({ task: "hold", background: true });
+  assert.deepEqual(started.details.results, []);
+  const { jobId } = started.details;
+  await f.workerReady;
+  assert.deepEqual(f.messages, []);
+  await f.execute({ action: "cancel", jobId });
+  await f.delivered;
+  assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+  assert.equal(f.messages.length, 1);
+  const [{ message, options }] = f.messages;
+  assert.match(message.content, /cancelled[\s\S]*Aborted by parent/);
+  assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: false });
+  const sessionDir = message.content.match(/^Session: (.*)$/m)[1];
+  t.after(() => rm(path.dirname(sessionDir), { recursive: true, force: true }));
+});
+
+test("Herdr chains use a tab per step and a resumed role uses a new tab with the saved session", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const workflow = { lifecycle: "workflow", workflowId: `herdr-resume-${process.pid}`, agentId: "role" };
+  const chain = await f.execute({ chain: [{ cwd: f.cwd, task: "first" }, { cwd: f.cwd, task: "next {previous}" }] });
+  assert.equal(chain.details.results[1].task, "next stub result");
+  const first = await f.execute({ ...workflow, task: "start" });
+  const saved = path.join(first.details.results[0].sessionDir, "session.jsonl");
+  const resumed = await f.execute({ ...workflow, task: "resume" });
+  assert.equal(resumed.details.results[0].sessionDir, path.dirname(saved));
+  const calls = await f.calls();
+  assert.equal(calls.length, 4);
+  assert.equal(new Set(calls.map(call => call.tab)).size, 4);
+  assert.equal(calls[2].workflow, workflow.workflowId);
+  assert.equal(calls[2].role, "role");
+  assert.ok(!calls[2].args.includes("--session"));
+  assert.equal(calls[3].args[calls[3].args.indexOf("--session") + 1], saved);
+  assert.deepEqual(f.closed, calls.map(call => call.tab));
+  await f.execute({ action: "closeWorkflow", workflowId: workflow.workflowId });
+});
+
+test("a broken Herdr result channel cannot report success even if the child exits zero", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const result = await f.execute({ task: "lose runner" });
+  assert.equal(result.details.results[0].status, "failed");
+  assert.match(result.content[0].text, /channel closed before an exit status/);
+  assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+  assert.equal((await f.calls()).length, 1);
+});
+
+test("workflow setup failure never opens a Herdr tab", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const workflowId = `herdr-setup-error-${process.pid}`;
+  const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
+  await mkdir(runDir, { recursive: true });
+  t.after(() => rm(runDir, { recursive: true, force: true }));
+  await writeFile(path.join(runDir, "session-role"), "block session directory");
+  await assert.rejects(f.execute({ lifecycle: "workflow", workflowId, agentId: "role", task: "do not start" }), { code: "EEXIST" });
+  assert.deepEqual(f.requests, []);
+  assert.deepEqual(await f.calls(), []);
+});
+
+test("workflow finalization failure closes its Herdr tab and preserves the error", { timeout: 10000 }, async t => {
+  const f = await herdrFixture(t);
+  const workflowId = `herdr-finalize-error-${process.pid}`;
+  const runDir = path.join(os.tmpdir(), "pi-subagents", `workflow-${workflowId}`);
+  const record = path.join(testAgentDir, "runtime", "subagent-workflows", workflowId, "workflow.json");
+  const controller = new AbortController();
+  t.after(() => rm(runDir, { recursive: true, force: true }));
+  const pending = f.execute({ lifecycle: "workflow", workflowId, agentId: "role", task: "hold" }, controller.signal);
+  await f.workerReady;
+  // Make writes to the workflow record fail after launch, without mocking filesystem calls.
+  const block = `${record}.${process.pid}.tmp`;
+  await mkdir(block);
+  t.after(() => rm(block, { recursive: true, force: true }));
+  controller.abort();
+  await assert.rejects(pending, { code: "EISDIR" });
+  assert.deepEqual(f.closed, [f.owned[0].tab_id]);
+  assert.equal(f.events.filter(e => e.name === "subagents:metrics-end/v1").length, 1);
 });
 
 test("extensions load in Pi", { skip: spawnSync("sh", ["-lc", "command -v pi"]).status !== 0 }, () => {

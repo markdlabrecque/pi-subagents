@@ -40,6 +40,12 @@ You can also manage them yourself without asking the agent: `/subagents` lists r
 
 Background runs need a long-lived session (interactive or RPC). In print mode (`-p`) Pi exits when the parent finishes its turn, which kills the child. Ending the session cancels all background jobs. The main agent's own edits are not covered by the file guard, so a background child and the parent can touch the same file.
 
+### Watching workers in Herdr
+
+In **Herdr TUI 0.9.5** (local Unix socket, protocol 22), Pi detects the inherited Herdr caller context automatically. Each worker gets a fresh tab in the caller's workspace, at the task's `cwd`, without stealing focus. This includes parallel workers, individual chain steps, background jobs, and resumed workflow roles. Outside Herdr, workers run headlessly as usual.
+
+The tab shows live progress, tool names, and worker output. It is for observation only: steer or cancel the work from the parent Pi session, not from the worker tab. On success, failure, timeout, or cancellation, Pi closes only the tab it created and reports the result in the parent. Closing the worker tab yourself interrupts the worker. If Herdr cannot confirm a launch, Pi reports the failure rather than trying a second copy headlessly. Cleanup problems are reported separately from the worker result. Herdr Desktop/Core is not supported.
+
 Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, 30 minutes per child, and 50 KB of model-visible output per child.
 
 ## Managed workflows: named profiles

@@ -10,6 +10,7 @@ import { Type, type Static } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
 import { renderAgentGrid, type AgentCard } from "./widget-layout.ts";
 import { createAgentActivity } from "./activity.ts";
+import { HerdrDispatch, inHerdr, type WorkerInvocation, type WorkerOutput } from "./herdr-transport.ts";
 
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -72,7 +73,7 @@ interface ActiveTask extends TaskSpec {
   id: string; status: Status; startedAt?: number; currentTool?: string; currentToolStartedAt?: number; modelUsed?: string; thinkingUsed?: ThinkingLevel;
   maxTokens?: number; contextTokens: number; output?: string; reason?: string; sessionDir?: string;
 }
-interface RunResult extends ActiveTask { exitCode: number; usage: { input: number; output: number; cost: number; turns: number }; }
+interface RunResult extends ActiveTask { exitCode: number; usage: { input: number; output: number; cost: number; turns: number }; cleanupWarning?: string; diagnostics?: string; }
 interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "management"; results: RunResult[]; workflows?: WorkflowRecord[]; jobId?: string; }
 interface WorkflowAgentRecord {
   workflowId: string; agentId: string; profile: string; builtin?: true; sessionDir: string; sessionFile?: string;
@@ -184,17 +185,19 @@ function trimOutput(text: string): string {
 function finalText(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m?.role !== "assistant") continue;
-    const text = m.content?.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n");
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    const text = m.content.filter((p: any) => p?.type === "text" && typeof p.text === "string").map((p: any) => p.text).join("\n");
     if (text) return text;
   }
   return "";
 }
 async function withConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const out = new Array<R>(items.length); let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+  const workers = await Promise.allSettled(Array.from({ length: Math.min(limit, items.length) }, async () => {
     while (true) { const i = next++; if (i >= items.length) return; out[i] = await fn(items[i], i); }
   }));
+  const rejected = workers.find(worker => worker.status === "rejected");
+  if (rejected) throw rejected.reason;
   return out;
 }
 async function removeOldFailedRuns(): Promise<void> {
@@ -210,6 +213,28 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
   const script = process.argv[1];
   if (script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)) return { command: process.execPath, args: [script, ...args] };
   return { command: "pi", args };
+}
+
+function runHeadless(invocation: WorkerInvocation, signal: AbortSignal, output: WorkerOutput): Promise<number> {
+  if (signal.aborted) return Promise.resolve(1);
+  const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd, stdio: ["ignore", "pipe", "pipe"], env: invocation.env });
+  return new Promise(resolve => {
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    };
+    signal.addEventListener("abort", stop, { once: true });
+    child.stdout.setEncoding("utf8").on("data", output.stdout);
+    child.stderr.setEncoding("utf8").on("data", output.stderr);
+    child.on("error", error => output.stderr(error.message));
+    child.once("close", code => {
+      clearTimeout(killTimer);
+      signal.removeEventListener("abort", stop);
+      resolve(code ?? 1);
+    });
+  });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -230,8 +255,8 @@ export default function (pi: ExtensionAPI) {
     });
   };
   const active = new Map<string, ActiveTask>();
-  const children = new Map<string, ReturnType<typeof spawn>>();
-  const childExits = new Map<string, Promise<void>>();
+  const children = new Map<string, (reason: string) => void>();
+  const dispatches = new Set<Promise<unknown>>();
   const workflowRuns = new Map<string, Promise<void>>();
   const closingWorkflows = new Set<string>();
   const closingAgents = new Set<string>();
@@ -267,11 +292,12 @@ export default function (pi: ExtensionAPI) {
     }));
   };
   pi.on("session_start", async (_e, ctx) => { widgetCtx = ctx; shuttingDown = false; await removeOldFailedRuns(); updateWidget(); });
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     shuttingDown = true;
+    for (const stop of children.values()) stop("Parent session shut down");
     for (const job of backgroundJobs.values()) { job.cancelled = true; job.controller.abort(); }
-    for (const [id, child] of children) { const task = active.get(id); if (task) task.status = "aborted"; child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
-    active.clear(); widgetCtx = undefined;
+    await Promise.allSettled(dispatches);
+    widgetCtx = undefined;
   });
 
   // Keep cleanup policy in one action implementation so tools and other extensions cannot diverge.
@@ -283,19 +309,11 @@ export default function (pi: ExtensionAPI) {
         // A run may be preparing before its first registry write. Mark it closing and await
         // every reserved run before deciding whether workflow metadata exists.
         let workflow = await readWorkflow(workflowId);
-        const exits: Promise<void>[] = [];
-        const stop = (ownerId: string) => {
-          const task = active.get(ownerId);
-          if (task) { task.status = "aborted"; task.reason = "Workflow closed"; active.delete(ownerId); }
-          const child = children.get(ownerId);
-          if (child) { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
-          const exit = childExits.get(ownerId); if (exit) exits.push(exit);
-        };
+        const stop = (ownerId: string) => children.get(ownerId)?.("Workflow closed");
         for (const agent of Object.values(workflow?.agents ?? {})) stop(agent.ownerId);
         for (const ownerId of children.keys()) if (ownerId.startsWith(`${safeId(workflowId)}:`)) stop(ownerId);
-        updateWidget();
-        exits.push(...[...workflowRuns.entries()].filter(([id]) => id.startsWith(`${safeId(workflowId)}:`)).map(([, run]) => run));
-        await Promise.all(exits);
+        const runs = [...workflowRuns.entries()].filter(([id]) => id.startsWith(`${safeId(workflowId)}:`)).map(([, run]) => run);
+        await Promise.all(runs);
         workflow = await readWorkflow(workflowId);
         if (!workflow) return `Workflow ${workflowId} is already closed`;
         return await mutateWorkflow(workflowId, async () => {
@@ -357,7 +375,7 @@ export default function (pi: ExtensionAPI) {
       const runOne = async (spec: TaskSpec, index: number, prior = ""): Promise<RunResult> => {
         const agent = requested[specs.indexOf(spec)]!;
         const id = workflowLifecycle ? `${safeId(params.workflowId!)}:${safeId(params.agentId!)}` : `${runId}-${index + 1}`;
-        const task = prior ? spec.task.replace(/\{previous\}/g, prior) : spec.task;
+        const task = prior ? spec.task.replace(/\{previous\}/g, () => prior) : spec.task;
         const state: ActiveTask = { ...spec, task, id, status: "queued", contextTokens: 0, workflowId: workflowLifecycle ? params.workflowId : undefined, agentId: workflowLifecycle ? params.agentId : undefined };
         const metrics = createChildMetrics((name, data) => pi.events.emit(name, data), parentToolCallId, index);
         const activity = createAgentActivity((name, data) => pi.events.emit(name, data), {
@@ -370,6 +388,11 @@ export default function (pi: ExtensionAPI) {
         const publishActivity = () => activity.update({ model: state.modelUsed, progress: { label: activityTool },
           stats: { turns: activityTurns, toolCalls: activityToolCalls, tokens: activityTokens } });
         let completedSuccessfully = false;
+        let herdr: HerdrDispatch | undefined;
+        let cleanupWarning: string | undefined;
+        let exitCode: number;
+        let diagnostics: string | undefined;
+        const usage = { input: 0, output: 0, cost: 0, turns: 0 };
         try {
         active.set(id, state); updateWidget();
         // Fresh reviewers get a new directory/context. The running-run guard above
@@ -404,8 +427,8 @@ export default function (pi: ExtensionAPI) {
           });
           workflowAttemptPersisted = true;
         }
-        const promptFile = path.join(runDir, `prompt-${index + 1}.md`);
-        await fs.promises.writeFile(promptFile, `${agent.systemPrompt}\n\nYou are a child subagent. You cannot delegate to other agents. Report completion, files changed, and unresolved issues.`);
+        const promptFile = path.join(sessionDir, "prompt.md");
+        await fs.promises.writeFile(promptFile, `${agent.systemPrompt}\n\nYou are a child subagent. You cannot delegate to other agents. Report completion, files changed, and unresolved issues.`, { mode: 0o600 });
         const args = ["--mode", "json", "-p", "--session-dir", sessionDir];
         if (!params.freshSession && existing?.sessionFile && fs.existsSync(existing.sessionFile)) args.push("--session", existing.sessionFile);
         args.push("--name", `subagent:${agent.name}:${id}`, "--extension", CHILD_GUARD, "--exclude-tools", "subagent", "--append-system-prompt", promptFile);
@@ -418,45 +441,65 @@ export default function (pi: ExtensionAPI) {
         args.push("--thinking", selectedThinking);
         if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
         args.push(`Task: ${task}`);
-        if (workflowLifecycle && (closingWorkflows.has(params.workflowId!) || closingAgents.has(id))) throw new Error(`Workflow agent ${params.workflowId}/${params.agentId} is closing`);
         const messages: any[] = []; let stderr = ""; let stopReason = ""; let errorMessage = "";
-        const usage = { input: 0, output: 0, cost: 0, turns: 0 };
-        const invocation = piInvocation(args);
-        let resolveChildExit!: () => void;
-        const childExit = new Promise<void>(resolve => { resolveChildExit = resolve; });
-        const exitCode = await new Promise<number>((resolve) => {
-          // Keep the sanitized run ID for subagent internals, but hand the raw workflow
-          // identity to workflow tools in separate fields. Encoding both in the run ID is
-          // lossy for arbitrary user-supplied workflow IDs.
-          const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_ID: id,
-            ...(workflowLifecycle ? { PI_WORKFLOW_ID: params.workflowId!, PI_WORKFLOW_ROLE: params.agentId! } : {}) };
-          if (maxTokens !== undefined) env.PI_SUBAGENT_MAX_TOKENS = String(maxTokens);
-          const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"], env });
-          children.set(id, child); childExits.set(id, childExit);
-          let buffer = ""; let finished = false;
-          const finish = (code: number) => { if (finished) return; finished = true; children.delete(id); childExits.delete(id); resolveChildExit(); clearTimeout(timer); resolve(code); };
-          const timer = setTimeout(() => { state.reason = `Timed out after ${Math.round(timeout / 60_000)} minutes`; child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }, timeout);
-          const abort = () => { state.reason = "Aborted by parent"; state.status = "aborted"; child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); };
-          if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
-          const line = (raw: string) => {
+        // Keep the raw workflow identity separate from the sanitized run ID.
+        const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_ID: id,
+          ...(workflowLifecycle ? { PI_WORKFLOW_ID: params.workflowId!, PI_WORKFLOW_ROLE: params.agentId! } : {}) };
+        if (maxTokens !== undefined) env.PI_SUBAGENT_MAX_TOKENS = String(maxTokens);
+        const invocation = { ...piInvocation(args), cwd: path.resolve(spec.cwd), env };
+        const controller = new AbortController();
+        let cancelled = false, buffer = "";
+        const stop = (reason: string, aborted = true) => {
+          if (controller.signal.aborted) return;
+          state.reason = reason; cancelled = aborted; controller.abort();
+        };
+        const abort = () => stop("Aborted by parent");
+        const line = (raw: string) => {
             if (!raw.trim()) return; let e: any; try { e = JSON.parse(raw); } catch { return; }
-            if (e.type === "tool_execution_start") { state.currentTool = `${e.toolName} ${JSON.stringify(e.args ?? {}).slice(0, 100)}`; state.currentToolStartedAt = Date.now(); updateWidget(); activityTool = typeof e.toolName === "string" ? e.toolName : "Tool running"; activityToolCalls++; publishActivity(); }
-            if (e.type === "tool_execution_end") { state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget(); activityTool = "Thinking"; publishActivity(); }
-            if (e.type === "message_end" && e.message) {
+            if (e?.type === "tool_execution_start") { state.currentTool = `${e.toolName} ${JSON.stringify(e.args ?? {}).slice(0, 100)}`; state.currentToolStartedAt = Date.now(); updateWidget(); activityTool = typeof e.toolName === "string" ? e.toolName : "Tool running"; activityToolCalls++; publishActivity(); }
+            if (e?.type === "tool_execution_end") { state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget(); activityTool = "Thinking"; publishActivity(); }
+            if (e?.type === "message_end" && e.message) {
               messages.push(e.message);
               metrics.observe(e.message);
               if (e.message.role === "assistant") { const u = e.message.usage; usage.turns++; usage.input += u?.input ?? 0; usage.output += u?.output ?? 0; usage.cost += u?.cost?.total ?? 0; state.contextTokens = u?.totalTokens ?? 0; state.modelUsed = e.message.model; stopReason = e.message.stopReason ?? stopReason; errorMessage = e.message.errorMessage ?? errorMessage; }
               if (e.message.role === "assistant") { activityTurns++; activityTokens = e.message.usage?.totalTokens; publishActivity(); }
-              onUpdate?.({ content: [{ type: "text", text: finalText(messages) || `${agent.name} is working...` }], details: { mode: "single", results: [] } }); updateWidget();
+              try {
+                onUpdate?.({ content: [{ type: "text", text: finalText(messages) || `${agent.name} is working...` }], details: { mode: "single", results: [] } });
+              } catch { /* A disconnected observer must not interrupt the worker. */ }
+              updateWidget();
             }
-          };
-          child.stdout.on("data", d => { buffer += d; const lines = buffer.split("\n"); buffer = lines.pop() ?? ""; lines.forEach(line); });
-          child.stderr.on("data", d => stderr += d.toString()); child.on("error", e => { stderr += e.message; finish(1); });
-          child.on("close", code => { if (buffer.trim()) line(buffer); finish(code ?? 1); });
-        });
+        };
+        const outputStream: WorkerOutput = {
+          stdout(text) { const lines = (buffer + text).split("\n"); buffer = lines.pop() ?? ""; lines.forEach(line); },
+          stderr(text) { stderr += text; },
+        };
+        children.set(id, stop);
+        const timer = setTimeout(() => stop(`Timed out after ${timeout / 60_000} minutes`, false), timeout);
+        if (shuttingDown) stop("Parent session shut down");
+        else if (workflowLifecycle && closingWorkflows.has(params.workflowId!)) stop("Workflow closed");
+        else if (workflowLifecycle && closingAgents.has(id)) stop("Agent closed");
+        if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+        try {
+          if (inHerdr(env)) {
+            herdr = new HerdrDispatch(env);
+            exitCode = await herdr.run(invocation, controller.signal, outputStream);
+          } else exitCode = await runHeadless(invocation, controller.signal, outputStream);
+        } catch (error) {
+          stderr += `${herdr ? "Herdr launch/transport failed: " : "Child launch failed: "}${error instanceof Error ? error.message : String(error)}\n`;
+          exitCode = 1;
+        } finally {
+          children.delete(id);
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+        }
+        if (buffer.trim()) line(buffer);
         const output = trimOutput(finalText(messages)); const failed = exitCode !== 0 || stopReason === "error" || stopReason === "aborted" || Boolean(state.reason);
-        state.status = failed ? (state.reason === "Aborted by parent" ? "aborted" : "failed") : "done"; state.output = output; state.reason ||= errorMessage || (failed ? stderr.trim() || `Child exited with code ${exitCode}` : undefined); state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget();
-        active.delete(id); updateWidget();
+        state.status = cancelled ? "aborted" : failed ? "failed" : "done";
+        state.output = output;
+        const stderrSummary = failed ? trimOutput(stderr.trim()) : "";
+        state.reason ||= errorMessage || (failed ? stderrSummary || `Child exited with code ${exitCode}` : undefined);
+        if (stderrSummary && stderrSummary !== state.reason) diagnostics = stderrSummary;
+        state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget();
         if (workflowLifecycle) await mutateWorkflow(params.workflowId!, async () => {
           workflow = await readWorkflow(params.workflowId!);
           if (workflow?.agents[params.agentId!]) {
@@ -469,18 +512,33 @@ export default function (pi: ExtensionAPI) {
           }
         });
         completedSuccessfully = true;
-        return { ...state, exitCode, usage };
         } catch (error) {
           activityError = error instanceof Error ? error.message : String(error);
+          if (workflowLifecycle) try {
+            await mutateWorkflow(params.workflowId!, async () => {
+              const workflow = await readWorkflow(params.workflowId!); const record = workflow?.agents[params.agentId!];
+              const endedAt = Date.now();
+              if (!workflow || !record || !settleExceptionalWorkflowTiming(record, workflowStartedAt, endedAt, workflowAttemptPersisted)) return;
+              record.status = state.status === "aborted" || closingWorkflows.has(params.workflowId!) || closingAgents.has(id) ? "aborted" : "failed";
+              record.reason = activityError; record.updatedAt = new Date(endedAt).toISOString(); record.lastEndedAt = record.updatedAt;
+              await writeWorkflow(workflow);
+            });
+          } catch (persistenceError) {
+            warn(ctx, `Could not record subagent failure: ${String(persistenceError)}`);
+          }
           throw error;
         } finally {
+          cleanupWarning = await herdr?.cleanup();
+          if (cleanupWarning && (!completedSuccessfully || shuttingDown)) warn(ctx, cleanupWarning);
           // Final persistence can throw after the subprocess already set status=done.
           metrics.finish(state, !completedSuccessfully);
-          const cancelled = state.status === "aborted" || signal?.aborted || shuttingDown || (workflowLifecycle && (closingWorkflows.has(params.workflowId!) || closingAgents.has(id)));
+          const cancelled = state.status === "aborted" || (!completedSuccessfully && (signal?.aborted || shuttingDown ||
+            (workflowLifecycle && (closingWorkflows.has(params.workflowId!) || closingAgents.has(id)))));
           activity.finish(cancelled ? "cancelled" : completedSuccessfully && state.status === "done" ? "completed" : "failed",
             activityError ?? state.reason ?? state.output ?? "");
           active.delete(id); updateWidget();
         }
+        return { ...state, exitCode, usage, ...(cleanupWarning ? { cleanupWarning } : {}), ...(diagnostics ? { diagnostics } : {}) };
       };
 
       let results: RunResult[] = [];
@@ -491,26 +549,25 @@ export default function (pi: ExtensionAPI) {
       else results = [await runOne(specs[0], 0)];
       const failed = results.filter(r => r.status !== "done");
       if (!workflowLifecycle && !failed.length) await fs.promises.rm(runDir, { recursive: true, force: true });
-      const summaries = results.map(r => `### ${r.agent} — ${r.status}\n${r.status === "done" ? r.output || "(no output)" : `Reason: ${r.reason || "unknown failure"}\nSession: ${r.sessionDir}`}`);
+      const summaries = results.map(r => {
+        const outcome = r.status === "done" ? r.output || "(no output)" : `Reason: ${r.reason || "unknown failure"}\nSession: ${r.sessionDir}`;
+        return [`### ${r.agent} — ${r.status}`, outcome, r.diagnostics && `Diagnostics: ${r.diagnostics}`, r.cleanupWarning && `Warning: ${r.cleanupWarning}`].filter(Boolean).join("\n");
+      });
         return { content: [{ type: "text" as const, text: `${results.length - failed.length}/${results.length} subagents completed\n\n${summaries.join("\n\n---\n\n")}` }], details: { mode: workflowLifecycle ? "workflow" : params.chain?.length ? "chain" : params.tasks?.length ? "parallel" : "single", results } as Details };
-      } catch (error: any) {
-        if (workflowLifecycle) await mutateWorkflow(params.workflowId!, async () => {
-          const workflow = await readWorkflow(params.workflowId!); const record = workflow?.agents[params.agentId!];
-          if (workflow && record) {
-            const endedAt = Date.now();
-            // If the running record was written, its resume idle interval is already
-            // charged. If setup failed first, preserve that interval before closing it.
-            if (!settleExceptionalWorkflowTiming(record, workflowStartedAt, endedAt, workflowAttemptPersisted)) return;
-            record.status = closingWorkflows.has(params.workflowId!) || closingAgents.has(workflowRunId!) ? "aborted" : "failed";
-            record.reason = error.message; record.updatedAt = new Date(endedAt).toISOString(); record.lastEndedAt = record.updatedAt;
-            await writeWorkflow(workflow);
-          }
-        });
-        throw error;
       } finally {
         if (workflowRunId) { active.delete(workflowRunId); updateWidget(); }
         releaseWorkflowRun?.();
       }
+  };
+
+  function warn(ctx: ExtensionContext, text: string) {
+    try { if (ctx.hasUI) ctx.ui.notify(text, "warning"); else console.error(text); } catch { /* Reporting is best effort. */ }
+  }
+  const dispatch = (...args: Parameters<typeof runSubagent>) => {
+    const run = runSubagent(...args);
+    dispatches.add(run);
+    void run.then(() => dispatches.delete(run), () => dispatches.delete(run));
+    return run;
   };
 
   // Background jobs run the same code path with their own abort signal, so the
@@ -554,7 +611,7 @@ export default function (pi: ExtensionAPI) {
     const jobId = `bg-${++backgroundSeq}`;
     const job = { controller: new AbortController(), agent, task: specs[0].task, startedAt: Date.now(), cancelled: false };
     backgroundJobs.set(jobId, job);
-    void runSubagent({ ...params, background: undefined }, job.controller.signal, undefined, ctx, parentToolCallId).then(
+    void dispatch({ ...params, background: undefined }, job.controller.signal, undefined, ctx, parentToolCallId).then(
       result => result.content.map(c => c.text).join("\n"),
       (error: any) => `Background subagent failed: ${error?.message ?? String(error)}`,
     ).then(text => {
@@ -626,13 +683,8 @@ export default function (pi: ExtensionAPI) {
         if (closingAgents.has(ownerId)) throw new Error(`Workflow agent ${params.workflowId}/${params.agentId} is already closing`);
         closingAgents.add(ownerId);
         try {
-          const task = active.get(ownerId);
-          if (task) { task.status = "aborted"; task.reason = "Agent closed"; active.delete(ownerId); }
-          const child = children.get(ownerId);
-          if (child) { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }
-          updateWidget();
-          const exit = childExits.get(ownerId); const run = workflowRuns.get(ownerId);
-          await Promise.all([exit, run].filter((value): value is Promise<void> => Boolean(value)));
+          children.get(ownerId)?.("Agent closed");
+          await workflowRuns.get(ownerId);
           await mutateWorkflow(params.workflowId, async () => {
             const workflow = await readWorkflow(params.workflowId!); const agent = workflow?.agents[params.agentId!];
             if (!workflow || !agent) throw new Error(`Unknown workflow agent: ${params.workflowId}/${params.agentId}`);
@@ -654,9 +706,9 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text }], details: { mode: "management", results: [] } as Details };
       }
       if (params.background) return startBackground(params, ctx, _id);
-      return runSubagent(params, signal, onUpdate, ctx, _id);
+      return dispatch(params, signal, onUpdate, ctx, _id);
     },
     renderCall(args, theme) { const count = args.tasks?.length ?? args.chain?.length ?? 1; return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", count === 1 ? args.agent ?? (profiles ? "single" : "general") : `${count} agents`) + (args.background ? theme.fg("muted", " (background)") : ""), 0, 0); },
-    renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); if (d.jobId) return new Text(theme.fg("muted", d.mode === "management" ? `cancelling ${d.jobId}` : `started ${d.jobId} in background`), 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}`).join("\n"), 0, 0); },
+    renderResult(result, _options, theme) { const d = result.details as Details | undefined; if (!d) return new Text("subagent", 0, 0); if (d.jobId) return new Text(theme.fg("muted", d.mode === "management" ? `cancelling ${d.jobId}` : `started ${d.jobId} in background`), 0, 0); const ok = d.results.filter(r => r.status === "done").length; return new Text(theme.fg(ok === d.results.length ? "success" : "warning", `${ok}/${d.results.length} completed`) + "\n" + d.results.map(r => `${r.status === "done" ? "✓" : "✗"} ${r.agent}: ${r.reason ?? (r.output || "").split("\n")[0]}${r.cleanupWarning ? `\n⚠ ${r.cleanupWarning}` : ""}`).join("\n"), 0, 0); },
   });
 }
