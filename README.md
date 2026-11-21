@@ -1,6 +1,6 @@
 # Subagent extension
 
-Delegates bounded tasks to isolated Pi subprocesses. Ordinary calls use a built-in general-purpose agent and need no profile files. Children inherit the parent's model, thinking level, working directory, context-file discovery, extensions and normal compaction behavior. Calls can override model, thinking, cwd, timeout and output limit.
+Delegates bounded tasks to isolated Pi subprocesses. Ordinary calls use a built-in general-purpose agent and need no profile files. Children inherit the parent's model and thinking level and use normal Pi context-file discovery, extensions and compaction. Calls can override model, thinking, timeout and output limit. Every task must supply an explicit, non-blank `cwd`, including workflow resumes and each entry in `tasks` or `chain`; there is no fallback to the parent's directory. The child's project settings (including `defaultTools`) load from that directory. Management calls such as `list`, `cancel`, `closeAgent` and `closeWorkflow` do not require `cwd`.
 
 ## Usage
 
@@ -13,13 +13,13 @@ Ask naturally, for example:
 The parent model calls `subagent` in one of these modes:
 
 ```ts
-{ task: "Implement ..." }
-{ tasks: [{ task: "Find ..." }, { task: "Review ..." }] }
-{ chain: [{ task: "Investigate ..." }, { task: "Plan from: {previous}" }] }
+{ task: "Implement ...", cwd: "/path/to/repo" }
+{ tasks: [{ task: "Find ...", cwd: "/path/to/repo" }, { task: "Review ...", cwd: "/path/to/other-repo" }] }
+{ chain: [{ task: "Investigate ...", cwd: "/path/to/repo" }, { task: "Plan from: {previous}", cwd: "/path/to/repo" }] }
 
 // Persistent role session
-{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", task: "Implement ..." }
-{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "reviewer", freshSession: true, task: "Review ..." }
+{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", task: "Implement ...", cwd: "/path/to/repo" }
+{ action: "run", lifecycle: "workflow", workflowId: "workflow-123", agentId: "reviewer", freshSession: true, task: "Review ...", cwd: "/path/to/repo" }
 { action: "list", workflowId: "workflow-123" }
 { action: "closeAgent", workflowId: "workflow-123", agentId: "implementer" }
 { action: "closeWorkflow", workflowId: "workflow-123" }
@@ -30,8 +30,8 @@ The parent model calls `subagent` in one of these modes:
 Single, parallel (`tasks`), and chain calls accept `background: true`. The tool returns a job id at once, so the parent can keep working or answer the user. One job covers the whole call: cancelling it stops every child in the batch or chain, and once the last child ends, the combined result is posted to the session as a `subagent-background-result` follow-up message that wakes the parent.
 
 ```ts
-{ task: "Review ...", background: true }   // -> "Started background subagent bg-1 ..."
-{ tasks: [{ task: "..." }, { task: "..." }], background: true }   // one job, bg-2
+{ task: "Review ...", cwd: "/path/to/repo", background: true }   // -> "Started background subagent bg-1 ..."
+{ tasks: [{ task: "...", cwd: "/path/to/repo" }, { task: "...", cwd: "/path/to/other-repo" }], background: true }   // one job, bg-2
 { action: "list" }                                            // shows running background jobs
 { action: "cancel", jobId: "bg-1" }                           // stops it; the cancel notice does not wake the parent
 ```
@@ -46,13 +46,13 @@ Parallel mode is used only when the parent explicitly supplies `tasks`. Limits a
 
 This is a breaking tool-contract change. To retain named profiles, set `PI_SUBAGENT_PROFILES=1` in the launching process and relaunch Pi. Only the exact value `1` enables them; changing the environment after registration does not change the running session. Factory's owner must update and verify its launcher before Factory adopts this version. This extension does not change Factory.
 
-In ordinary sessions, remove `agent`, `agentScope` and `confirmProjectAgents` from calls, including entries in `tasks` and `chain`. These legacy fields are rejected rather than ignored. For example, change `{ agent: "worker", task: "Implement ..." }` to `{ task: "Implement ..." }`. A workflow's `agentId` remains its stable role identifier, not a profile selector. Existing named-profile workflow sessions cannot be resumed as general-purpose: relaunch with profiles enabled or use a new workflow identity. You can still list or close them in ordinary mode. No profile files or workflow data need deletion.
+In ordinary sessions, remove `agent`, `agentScope` and `confirmProjectAgents` from calls, including entries in `tasks` and `chain`. These legacy fields are rejected rather than ignored. For example, change `{ agent: "worker", task: "Implement ...", cwd: "/path/to/repo" }` to `{ task: "Implement ...", cwd: "/path/to/repo" }`. A workflow's `agentId` remains its stable role identifier, not a profile selector. Existing named-profile workflow sessions cannot be resumed as general-purpose: relaunch with profiles enabled or use a new workflow identity. You can still list or close them in ordinary mode. No profile files or workflow data need deletion.
 
 In profile-enabled sessions, select exact names for every task:
 
 ```ts
-{ agent: "worker", task: "Implement ..." }
-{ lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", agent: "worker", task: "Implement ..." }
+{ agent: "worker", task: "Implement ...", cwd: "/path/to/repo" }
+{ lifecycle: "workflow", workflowId: "workflow-123", agentId: "implementer", agent: "worker", task: "Implement ...", cwd: "/path/to/repo" }
 ```
 
 Use the `list_agent_profiles` tool to see profiles currently discoverable by the extension, including their source and configuration. It accepts `agentScope: "user"` (default), `"project"`, or `"both"`; project-local profiles are listed but are still subject to confirmation when launched.
@@ -122,5 +122,7 @@ Keep intermediate commits through review. Compare the original test baseline, th
 Workflow `list` details report cumulative active run time separately from persistent idle/waiting time, so between-dispatch waiting is never charged as active execution.
 
 ## UI
+
+Experimental: subagent dispatches also publish `pi:activity/v1` lifecycle events for opt-in observers. Unlike the metrics events above, activity events may include task or result text.
 
 The `Agents` widget shows each active agent in a boxed card with its name, elapsed time, model/thinking level, current tool call and tool duration, context usage. While no tool is active, it shows `thinking...`. Cards are arranged horizontally across the available terminal width and wrap onto additional rows on narrower screens.

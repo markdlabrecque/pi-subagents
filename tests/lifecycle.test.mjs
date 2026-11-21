@@ -172,19 +172,51 @@ test("tool schemas preserve scope, thinking, and maxTokens validation", async ()
     const valid = typeof thinking === "string" && thinking !== "invalid";
     assert.equal(Check(params, { thinking }), valid);
     for (const mode of ["tasks", "chain"]) {
-      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", thinking }] }), valid);
+      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", cwd: os.tmpdir(), thinking }] }), valid);
     }
   }
   for (const maxTokens of [1, 4096, 0, -1, 1.5, "4096", null]) {
     const valid = Number.isInteger(maxTokens) && maxTokens > 0;
     assert.equal(Check(params, { maxTokens }), valid);
     for (const mode of ["tasks", "chain"]) {
-      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", maxTokens }] }), valid);
+      assert.equal(Check(params, { [mode]: [{ agent: "worker", task: "work", cwd: os.tmpdir(), maxTokens }] }), valid);
     }
   }
   for (const schema of [params.properties.agentScope, params.properties.thinking, params.properties.action, params.properties.lifecycle]) {
     assert.equal(schema.type, "string");
     assert.ok(Array.isArray(schema.enum), "retain provider-compatible string enums");
+  }
+});
+
+test("dispatch requires explicit non-blank cwd for every task before starting a job", async () => {
+  const { Check } = await import(piRequire.resolve("typebox/value"));
+  const prior = process.env.PI_SUBAGENT_PROFILES;
+  try {
+    for (const profiles of [false, true]) {
+      if (profiles) process.env.PI_SUBAGENT_PROFILES = "1"; else delete process.env.PI_SUBAGENT_PROFILES;
+      const tools = new Map();
+      subagentModule.default({ events: { on() {} }, on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); } });
+      const tool = tools.get("subagent");
+      const task = { task: "work", ...(profiles ? { agent: "worker" } : {}) };
+      const ctx = { cwd: os.tmpdir(), hasUI: false };
+      for (const cwd of [undefined, "", " \t\n", null, 1]) {
+        const entry = { ...task, ...(cwd === undefined ? {} : { cwd }) };
+        for (const input of [entry, { tasks: [entry] }, { chain: [entry] }, { tasks: [{ ...task, cwd: os.tmpdir() }, entry] }, { ...entry, lifecycle: "workflow", workflowId: "w", agentId: "a" }]) {
+          for (const background of [false, true]) {
+            await assert.rejects(tool.execute("cwd", { ...input, background }, undefined, undefined, ctx), /requires an explicit, non-blank cwd/);
+          }
+        }
+        for (const mode of ["tasks", "chain"]) assert.equal(Check(tool.parameters, { [mode]: [entry] }), false);
+      }
+      for (const cwd of [os.tmpdir(), "."]) {
+        assert.equal(Check(tool.parameters, { ...task, cwd }), true);
+        for (const mode of ["tasks", "chain"]) assert.equal(Check(tool.parameters, { [mode]: [{ ...task, cwd }] }), true);
+      }
+      const listed = await tool.execute("list", { action: "list" }, undefined, undefined, ctx);
+      assert.match(listed.content[0].text, /No background jobs/);
+    }
+  } finally {
+    if (prior === undefined) delete process.env.PI_SUBAGENT_PROFILES; else process.env.PI_SUBAGENT_PROFILES = prior;
   }
 });
 
@@ -431,19 +463,23 @@ test("workflow setup failures retain their original error", async () => {
     }));
     await mkdir(runDir, { recursive: true });
     await writeFile(path.join(runDir, "session-researcher"), "force lifecycle session mkdir failure");
+    const activityEvents = [];
     const pi = {
-      events: { on() {} }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {},
+      events: { on() {}, emit(name, data) { if (name === "pi:activity/v1") activityEvents.push(data); } }, on() {}, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {},
       getThinkingLevel() { return "medium"; },
     };
     const childFlag = process.env.PI_SUBAGENT_CHILD;
     delete process.env.PI_SUBAGENT_CHILD;
     try { registerProfiles(pi); } finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
-    const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
+    const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } }, sessionManager: { getSessionId() { return "setup-session"; } } };
     const error = await tools.get("subagent").execute("setup", {
-      action: "run", lifecycle: "workflow", workflowId, agentId: "researcher", agent: "researcher", task: "research", agentScope: "project", confirmProjectAgents: false,
+      action: "run", lifecycle: "workflow", workflowId, agentId: "researcher", agent: "researcher", task: "research", cwd, agentScope: "project", confirmProjectAgents: false,
     }, undefined, undefined, ctx).then(() => undefined, failure => failure);
     assert.equal(error?.code, "EEXIST");
     assert.doesNotMatch(String(error?.message), /workflowStartedAt|not defined/);
+    assert.deepEqual(activityEvents.map(item => item.status), ["running", "failed"], "setup must settle the UI even before a subprocess starts");
+    assert.match(activityEvents.at(-1).result, /EEXIST/);
+    assert.equal(activityEvents.at(-1).sessionId, "setup-session");
     const retained = JSON.parse(await readFile(path.join(workflowDir, "workflow.json"), "utf8"));
     assert.equal(retained.agents.researcher.reason, "prior result");
     assert.equal(retained.agents.researcher.activeRunMs, 10);
@@ -471,7 +507,7 @@ test("background runs return at once and deliver the outcome as a follow-up turn
   try {
     const { subagent, messages } = loadWithFakePi();
     const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() { return undefined; } } };
-    const started = await subagent.execute("bg", { agent: "no-such-agent", task: "x", background: true }, undefined, undefined, ctx);
+    const started = await subagent.execute("bg", { agent: "no-such-agent", task: "x", cwd, background: true }, undefined, undefined, ctx);
     assert.match(started.content[0].text, /Started background subagent bg-1/);
     assert.equal(started.details.jobId, "bg-1");
     for (let i = 0; i < 50 && !messages.length; i++) await new Promise(r => setTimeout(r, 10));
@@ -486,8 +522,8 @@ test("background runs return at once and deliver the outcome as a follow-up turn
 test("parallel and chain calls run as one background job each; cancel needs a live job", async () => {
   const { subagent, messages } = loadWithFakePi();
   const ctx = { cwd: os.tmpdir(), hasUI: false, ui: { setWidget() {} } };
-  const parallel = await subagent.execute("bg", { tasks: [{ agent: "a", task: "t" }, { agent: "b", task: "t" }], background: true }, undefined, undefined, ctx);
-  const chain = await subagent.execute("bg", { chain: [{ agent: "c", task: "t" }, { agent: "d", task: "{previous}" }], background: true }, undefined, undefined, ctx);
+  const parallel = await subagent.execute("bg", { tasks: [{ agent: "a", task: "t", cwd: ctx.cwd }, { agent: "b", task: "t", cwd: ctx.cwd }], background: true }, undefined, undefined, ctx);
+  const chain = await subagent.execute("bg", { chain: [{ agent: "c", task: "t", cwd: ctx.cwd }, { agent: "d", task: "{previous}", cwd: ctx.cwd }], background: true }, undefined, undefined, ctx);
   assert.match(parallel.content[0].text, /bg-1 \(parallel: a, b\)/);
   assert.match(chain.content[0].text, /bg-2 \(chain: c → d\)/);
   for (let i = 0; i < 50 && messages.length < 2; i++) await new Promise(r => setTimeout(r, 10));
@@ -525,6 +561,8 @@ const args = process.argv.slice(2); const prompt = fs.readFileSync(args[args.ind
 fs.writeFileSync(path.join(process.cwd(), 'observed.json'), JSON.stringify({ args, prompt }));
 if (args.at(-1).includes('fail fixture')) { console.error('stub failure diagnostics'); process.exit(7); }
 const role = process.env.PI_WORKFLOW_ROLE;
+console.log(JSON.stringify({type:'tool_execution_start',toolName:'read',args:{path:'private-tool-argument'}}));
+console.log(JSON.stringify({type:'tool_execution_end',toolName:'read'}));
 const finish = () => console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:role === 'auditor' ? 'stub audit complete' : 'stub review complete'}],model:'stub-model',provider:'stub-provider',usage:{input:0,output:5,cacheRead:10,cost:{total:0}},stopReason:'stop'}}));
 if (role) {
   fs.writeFileSync(path.join(process.cwd(), 'ready-' + role), 'ready');
@@ -539,14 +577,17 @@ if (role) {
   const tools = new Map();
   const childFlag = process.env.PI_SUBAGENT_CHILD;
   delete process.env.PI_SUBAGENT_CHILD;
-  const metricsEvents = [];
+  const metricsEvents = [], activities = [];
   let deliverBackground;
   const backgroundDone = new Promise(resolve => { deliverBackground = resolve; });
-  try { registerProfiles({ events: { on() {}, emit(name, data) { metricsEvents.push({ name, data }); } }, on() {},
+  try { registerProfiles({ events: { on() {}, emit(name, data) {
+    if (name.startsWith("subagents:metrics-")) metricsEvents.push({ name, data });
+    if (name === "pi:activity/v1") activities.push(data);
+  } }, on() {},
     sendMessage() { deliverBackground(); }, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {}, getThinkingLevel() { return "medium"; } }); }
   finally { if (childFlag !== undefined) process.env.PI_SUBAGENT_CHILD = childFlag; }
-  const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() {} } };
-  const execute = (params, signal) => tools.get("subagent").execute("stub", { agent: "reviewer", task: "read-only review", agentScope: "project", confirmProjectAgents: false, ...params }, signal, undefined, ctx);
+  const ctx = { cwd, hasUI: false, ui: { setWidget() {} }, modelRegistry: { find() {} }, sessionManager: { getSessionId() { return "parent-session"; } } };
+  const execute = (params, signal) => tools.get("subagent").execute("stub", { agent: "reviewer", task: "read-only review", cwd, agentScope: "project", confirmProjectAgents: false, ...params }, signal, undefined, ctx);
   const terminal = await execute({});
   assert.equal(terminal.details.results[0].status, "done");
   await assert.rejects(stat(path.join(cwd, ".git")), { code: "ENOENT" });
@@ -623,6 +664,22 @@ if (role) {
     }
   }
   assert.doesNotMatch(JSON.stringify(metricsEvents), /stub review complete|read-only review|stub failure diagnostics/);
+  const activityEnds = activities.filter(item => item.status !== "running");
+  assert.equal(activityEnds.length, 6, "each foreground, workflow and background dispatch ends once");
+  assert.equal(new Set(activityEnds.map(item => item.id)).size, 6);
+  assert.deepEqual(new Set(activityEnds.map(item => item.status)), new Set(["completed", "failed", "cancelled"]));
+  assert.ok(activities.some(item => item.progress?.label === "read"), "child tools reach semantic progress");
+  assert.doesNotMatch(JSON.stringify(activities), /private-tool-argument/, "progress must not expose tool arguments");
+  for (const end of activityEnds) {
+    assert.equal(end.sessionId, "parent-session");
+    assert.equal(activities.filter(item => item.id === end.id && item.status !== "running").length, 1);
+    assert.ok(activities.some(item => item.id === end.id && item.status === "running"));
+    if (end.status === "completed") {
+      assert.equal(end.stats.turns, 1);
+      assert.equal(end.stats.toolCalls, 1);
+      assert.equal(end.stats.tokens, undefined, "unknown token counts are not fabricated");
+    }
+  }
   // Fail the second registry write: setup succeeds, but final persistence fails
   // after the subprocess has already reported a successful assistant response.
   const mutableFS = (await import("node:fs")).default.promises;
@@ -640,6 +697,8 @@ if (role) {
   const finalCompletion = metricsEvents.filter(e => e.name === "subagents:metrics-end/v1").at(-1).data;
   assert.equal(finalCompletion.outcome, "failed", "post-execution finalization must not emit a successful child outcome");
   assert.equal(finalCompletion.usage.output, 5, "observed usage survives finalization failure");
+  assert.equal(activities.at(-1).status, "failed", "finalization failure must also fail the UI activity");
+  assert.match(activities.at(-1).result, /forced final registry write failure/);
   const failedRecord = JSON.parse(await readFile(path.join(workflowDir, "workflow.json"), "utf8"));
   assert.equal(failedRecord.agents.reviewer.status, "failed");
 });
@@ -776,10 +835,10 @@ test("built-in dispatch runs all modes and preserves workflow identity", async t
   assert.equal(await readFile(recordPath, "utf8"), before);
   globalThis[agentProviders].set("named", () => [{ name: "other", description: "test", systemPrompt: "named prompt", model: "named/model", thinking: "low", tools: ["read"], maxTokens: 40 }]);
   await assert.rejects(namedTool.execute("missing", { task: "x" }, undefined, undefined, ctx), /requires an agent name/);
-  await assert.rejects(namedTool.execute("unknown", { agent: "Other", task: "x" }, undefined, undefined, ctx), /Unknown agents: Other/);
+  await assert.rejects(namedTool.execute("unknown", { agent: "Other", task: "x", cwd: childCwd }, undefined, undefined, ctx), /Unknown agents: Other/);
   let approvals = 0;
   const untrusted = { ...ctx, hasUI: true, ui: { setWidget() {}, async confirm() { approvals++; return false; } } };
-  await assert.rejects(namedTool.execute("project", { agent: "general", agentScope: "project", task: "x" }, undefined, undefined, untrusted), /not approved/);
+  await assert.rejects(namedTool.execute("project", { agent: "general", agentScope: "project", task: "x", cwd: childCwd }, undefined, undefined, untrusted), /not approved/);
   assert.equal(approvals, 1);
   const named = await namedTool.execute("named", { ...params, cwd: childCwd, agent: "other" }, undefined, undefined, ctx);
   assert.equal(named.details.results[0].status, "done");

@@ -9,6 +9,7 @@ import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
 import { renderAgentGrid, type AgentCard } from "./widget-layout.ts";
+import { createAgentActivity } from "./activity.ts";
 
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -36,7 +37,7 @@ async function mutateWorkflow<T>(workflowId: string, operation: () => Promise<T>
 
 type Status = "queued" | "running" | "done" | "failed" | "aborted";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-interface TaskSpec { agent: string; task: string; cwd?: string; model?: string; thinking?: ThinkingLevel; maxTokens?: number; workflowId?: string; agentId?: string; }
+interface TaskSpec { agent: string; task: string; cwd: string; model?: string; thinking?: ThinkingLevel; maxTokens?: number; workflowId?: string; agentId?: string; }
 
 export function normalizeMaxTokens(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
@@ -107,7 +108,7 @@ const taskSchema = (profiles: boolean) => Type.Object({
     confirmProjectAgents: Type.Optional(Type.Unknown({ description: "Deprecated: profile mode only" })),
   } : {}),
   task: Type.String({ description: "Specific delegated instruction" }),
-  cwd: Type.Optional(Type.String({ description: "Working directory; defaults to the parent cwd" })),
+  cwd: Type.String({ pattern: "\\S", description: "Required working directory. Child settings and tools are loaded from this directory." }),
   model: Type.Optional(Type.String({ description: "Optional model override" })),
   thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
@@ -117,7 +118,7 @@ const paramsSchema = (profiles: boolean) => Type.Object({
   lifecycle: Type.Optional(Type.Enum(["terminal", "workflow"] as const, { type: "string", default: "terminal" })),
   workflowId: Type.Optional(Type.String({ description: "Stable workflow identifier for workflow lifecycle" })),
   agentId: Type.Optional(Type.String({ description: "Stable role identifier for workflow lifecycle" })),
-  agent: profiles ? Type.Optional(Type.String({ description: "Exact agent profile name" })) : legacyAgent, task: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
+  agent: profiles ? Type.Optional(Type.String({ description: "Exact agent profile name" })) : legacyAgent, task: Type.Optional(Type.String()), cwd: Type.Optional(Type.String({ pattern: "\\S", description: "Required for a single task, including workflow resumes. Child settings and tools are loaded from this directory." })),
   model: Type.Optional(Type.String({ description: "Optional model override for single mode" })),
   thinking: Type.Optional(Type.Enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { type: "string", description: "Optional thinking-level override for single mode" })),
   maxTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional maximum output tokens override" })),
@@ -223,7 +224,10 @@ export default function (pi: ExtensionAPI) {
     const specs = single.length ? single : params.tasks?.length ? params.tasks : params.chain!;
     if (specs.length > MAX_TASKS) throw new Error(`Maximum ${MAX_TASKS} tasks`);
     if (profiles && specs.some(s => !s.agent)) throw new Error("Named profile mode requires an agent name for every task.");
-    return specs.map(s => ({ ...s, agent: profiles ? s.agent! : GENERAL.name }));
+    return specs.map((s, index) => {
+      if (typeof s.cwd !== "string" || !s.cwd.trim()) throw new Error(`Task ${index + 1} requires an explicit, non-blank cwd. Child settings and tools are loaded from this directory.`);
+      return { ...s, cwd: s.cwd, agent: profiles ? s.agent! : GENERAL.name };
+    });
   };
   const active = new Map<string, ActiveTask>();
   const children = new Map<string, ReturnType<typeof spawn>>();
@@ -356,6 +360,15 @@ export default function (pi: ExtensionAPI) {
         const task = prior ? spec.task.replace(/\{previous\}/g, prior) : spec.task;
         const state: ActiveTask = { ...spec, task, id, status: "queued", contextTokens: 0, workflowId: workflowLifecycle ? params.workflowId : undefined, agentId: workflowLifecycle ? params.agentId : undefined };
         const metrics = createChildMetrics((name, data) => pi.events.emit(name, data), parentToolCallId, index);
+        const activity = createAgentActivity((name, data) => pi.events.emit(name, data), {
+          sessionId: ctx.sessionManager?.getSessionId?.() ?? "", task, agent: agent.name,
+          model: spec.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+        });
+        let activityError: string | undefined;
+        let activityTool = "Thinking", activityToolCalls = 0, activityTurns = 0;
+        let activityTokens: number | undefined;
+        const publishActivity = () => activity.update({ model: state.modelUsed, progress: { label: activityTool },
+          stats: { turns: activityTurns, toolCalls: activityToolCalls, tokens: activityTokens } });
         let completedSuccessfully = false;
         try {
         active.set(id, state); updateWidget();
@@ -364,7 +377,7 @@ export default function (pi: ExtensionAPI) {
         const validateIdentity = (prior: WorkflowAgentRecord | undefined) => {
           if (!prior) return;
           if (!profiles && (prior.profile !== agent.name || prior.builtin !== true)) throw new Error("Cannot resume a named-profile workflow as general-purpose. Relaunch with PI_SUBAGENT_PROFILES=1 or use a new workflow identity.");
-          if ((profiles && prior.builtin === true) || prior.profile !== agent.name || prior.cwd !== path.resolve(spec.cwd ?? ctx.cwd)) throw new Error("A workflow agent cannot change profile or working directory when resumed");
+          if ((profiles && prior.builtin === true) || prior.profile !== agent.name || prior.cwd !== path.resolve(spec.cwd)) throw new Error("A workflow agent cannot change profile or working directory when resumed");
         };
         if (workflowLifecycle) validateIdentity((await readWorkflow(params.workflowId!))?.agents[params.agentId!]);
         const sessionDir = workflowLifecycle ? path.join(runDir, `session-${safeId(params.agentId!)}${params.freshSession ? `-${crypto.randomUUID()}` : ""}`) : path.join(runDir, `session-${index + 1}`);
@@ -385,7 +398,7 @@ export default function (pi: ExtensionAPI) {
             const idleWaitingMs = (existing?.idleWaitingMs ?? 0) + (existing?.lastEndedAt ? Math.max(0, Date.now() - Date.parse(existing.lastEndedAt)) : 0);
             workflow.agents[params.agentId!] = { workflowId: params.workflowId!, agentId: params.agentId!, profile: agent.name, ...(!profiles ? { builtin: true as const } : {}), sessionDir,
               sessionFile: params.freshSession ? undefined : existing?.sessionFile, status: "running", model: spec.model ?? agent.model, thinking: spec.thinking ?? agent.thinking ?? pi.getThinkingLevel(), maxTokens,
-              cwd: path.resolve(spec.cwd ?? ctx.cwd), createdAt: existing?.createdAt ?? now, updatedAt: now, ownerId: id, lastTask: task, lastResult: existing?.lastResult,
+              cwd: path.resolve(spec.cwd), createdAt: existing?.createdAt ?? now, updatedAt: now, ownerId: id, lastTask: task, lastResult: existing?.lastResult,
               activeRunMs: existing?.activeRunMs ?? 0, idleWaitingMs }; 
             await writeWorkflow(workflow);
           });
@@ -399,6 +412,7 @@ export default function (pi: ExtensionAPI) {
         const selectedModel = spec.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
         const maxTokens = clampMaxTokens(resolveMaxTokens({ perCall: spec.maxTokens, existing: existing?.maxTokens, profile: agent.maxTokens }), modelMaxTokens(ctx, selectedModel));
         const selectedThinking = spec.thinking ?? agent.thinking ?? pi.getThinkingLevel(); state.modelUsed = selectedModel; state.thinkingUsed = selectedThinking; state.maxTokens = maxTokens;
+        publishActivity();
         if (maxTokens !== undefined) args.push("--extension", MAX_TOKENS_OVERRIDE);
         if (selectedModel) args.push("--model", selectedModel);
         args.push("--thinking", selectedThinking);
@@ -417,7 +431,7 @@ export default function (pi: ExtensionAPI) {
           const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_ID: id,
             ...(workflowLifecycle ? { PI_WORKFLOW_ID: params.workflowId!, PI_WORKFLOW_ROLE: params.agentId! } : {}) };
           if (maxTokens !== undefined) env.PI_SUBAGENT_MAX_TOKENS = String(maxTokens);
-          const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd ?? ctx.cwd, stdio: ["ignore", "pipe", "pipe"], env });
+          const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"], env });
           children.set(id, child); childExits.set(id, childExit);
           let buffer = ""; let finished = false;
           const finish = (code: number) => { if (finished) return; finished = true; children.delete(id); childExits.delete(id); resolveChildExit(); clearTimeout(timer); resolve(code); };
@@ -426,12 +440,13 @@ export default function (pi: ExtensionAPI) {
           if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
           const line = (raw: string) => {
             if (!raw.trim()) return; let e: any; try { e = JSON.parse(raw); } catch { return; }
-            if (e.type === "tool_execution_start") { state.currentTool = `${e.toolName} ${JSON.stringify(e.args ?? {}).slice(0, 100)}`; state.currentToolStartedAt = Date.now(); updateWidget(); }
-            if (e.type === "tool_execution_end") { state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget(); }
+            if (e.type === "tool_execution_start") { state.currentTool = `${e.toolName} ${JSON.stringify(e.args ?? {}).slice(0, 100)}`; state.currentToolStartedAt = Date.now(); updateWidget(); activityTool = typeof e.toolName === "string" ? e.toolName : "Tool running"; activityToolCalls++; publishActivity(); }
+            if (e.type === "tool_execution_end") { state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget(); activityTool = "Thinking"; publishActivity(); }
             if (e.type === "message_end" && e.message) {
               messages.push(e.message);
               metrics.observe(e.message);
               if (e.message.role === "assistant") { const u = e.message.usage; usage.turns++; usage.input += u?.input ?? 0; usage.output += u?.output ?? 0; usage.cost += u?.cost?.total ?? 0; state.contextTokens = u?.totalTokens ?? 0; state.modelUsed = e.message.model; stopReason = e.message.stopReason ?? stopReason; errorMessage = e.message.errorMessage ?? errorMessage; }
+              if (e.message.role === "assistant") { activityTurns++; activityTokens = e.message.usage?.totalTokens; publishActivity(); }
               onUpdate?.({ content: [{ type: "text", text: finalText(messages) || `${agent.name} is working...` }], details: { mode: "single", results: [] } }); updateWidget();
             }
           };
@@ -455,9 +470,16 @@ export default function (pi: ExtensionAPI) {
         });
         completedSuccessfully = true;
         return { ...state, exitCode, usage };
+        } catch (error) {
+          activityError = error instanceof Error ? error.message : String(error);
+          throw error;
         } finally {
           // Final persistence can throw after the subprocess already set status=done.
           metrics.finish(state, !completedSuccessfully);
+          const cancelled = state.status === "aborted" || signal?.aborted || shuttingDown || (workflowLifecycle && (closingWorkflows.has(params.workflowId!) || closingAgents.has(id)));
+          activity.finish(cancelled ? "cancelled" : completedSuccessfully && state.status === "done" ? "completed" : "failed",
+            activityError ?? state.reason ?? state.output ?? "");
+          active.delete(id); updateWidget();
         }
       };
 
