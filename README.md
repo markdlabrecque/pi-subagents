@@ -44,9 +44,11 @@ Background runs need a long-lived session (interactive or RPC). In print mode (`
 
 In **Herdr TUI 0.9.5** (local Unix socket, protocol 22), Pi detects the inherited Herdr caller context automatically. Each worker gets a fresh tab in the caller's workspace, at the task's `cwd`, without stealing focus. This includes parallel workers, individual chain steps, background jobs, and resumed workflow roles. Outside Herdr, workers run headlessly as usual.
 
-The tab shows live progress, tool names, and worker output. It is for observation only: steer or cancel the work from the parent Pi session, not from the worker tab. On success, failure, timeout, or cancellation, Pi closes only the tab it created and reports the result in the parent. Closing the worker tab yourself interrupts the worker. If Herdr cannot confirm a launch, Pi reports the failure rather than trying a second copy headlessly. Cleanup problems are reported separately from the worker result. Herdr Desktop/Core is not supported.
+The tab streams assistant text as it is generated, even when the worker does not use tools. It also shows tool names and diagnostics. It is for observation only: steer or cancel work from the parent Pi session, not from the worker tab. Pi closes only the tab it created and reports the result in the parent. Closing a worker tab yourself interrupts the worker. After an ambiguous launch, Pi checks for the exact owned tab for up to four seconds and never starts a second copy headlessly. A tab created after that window may need manual cleanup; cleanup warnings are separate from the worker outcome. Herdr Desktop/Core is not supported.
 
-Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, 30 minutes per child, and 50 KB of model-visible output per child.
+If the result channel drops after launch, Pi waits up to seven seconds for evidence that the worker exited. A closed tab is not proof of exit. If Pi cannot confirm termination, the workflow role remains unavailable and its saved session is left intact: neither redispatch (including `freshSession`) nor workflow cleanup can clear that guard. Verify the worker is stopped before recovering the role manually.
+
+Parallel mode is used only when the parent explicitly supplies `tasks`. Limits are 8 tasks, 4 concurrent tasks, and 30 minutes per child. Each child's model-visible reason, diagnostics, and output share a 50 KB budget.
 
 ## Managed workflows: named profiles
 

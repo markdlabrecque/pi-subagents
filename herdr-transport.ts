@@ -1,15 +1,30 @@
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
+import { KILL_GRACE_MS } from "./worker-stop.mjs";
 
 const RPC_TIMEOUT_MS = 2_000;
 const START_TIMEOUT_MS = 5_000;
-const STOP_TIMEOUT_MS = 7_000; // Longer than the runner's TERM-to-KILL grace period.
+const ALLOCATION_RECONCILE_MS = 4_000;
+const STOP_TIMEOUT_MS = KILL_GRACE_MS + 2_000;
+const CHECK_INTERVAL_MS = 100;
 const RUNNER = join(import.meta.dirname, "herdr-worker.mjs");
+
+async function confirmStopped(path: string, deadline: number): Promise<boolean> {
+  do {
+    try { await access(path); return true; }
+    catch { /* Absence is not evidence of exit. */ }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(CHECK_INTERVAL_MS, remaining));
+  } while (true);
+}
 
 export interface WorkerInvocation {
   command: string;
@@ -27,13 +42,13 @@ class HerdrError extends Error {
   constructor(readonly code: string, message: string) { super(`${code}: ${message}`); }
 }
 
-function rpc(socketPath: string, method: string, params: object): Promise<any> {
+function rpc(socketPath: string, method: string, params: object, timeoutMs = RPC_TIMEOUT_MS): Promise<any> {
   return new Promise((resolve, reject) => {
     const id = randomUUID();
     const socket = createConnection(socketPath, () => socket.write(JSON.stringify({ id, method, params }) + "\n"));
     const reader = createInterface({ input: socket, crlfDelay: Infinity });
     let settled = false;
-    const timer = setTimeout(() => finish(new Error(`${method} timed out`)), RPC_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`${method} timed out`)), timeoutMs);
     function finish(error?: Error, result?: unknown) {
       if (settled) return;
       settled = true;
@@ -62,6 +77,9 @@ export class HerdrDispatch {
   private paneId?: string;
   private allocation: "none" | "uncertain" | "acknowledged" | "rejected" = "none";
   private channelWarning?: string;
+  private pendingTermination = false;
+
+  get terminationUnconfirmed(): boolean { return this.pendingTermination; }
 
   constructor(private readonly env: NodeJS.ProcessEnv) {}
 
@@ -77,12 +95,14 @@ export class HerdrDispatch {
 
     const dir = await mkdtemp(join(tmpdir(), "pi-sa-")); // mode 0700; task and env never go through Herdr's API.
     const channel = join(dir, "worker.sock");
+    const stoppedPath = join(dir, "stopped");
     const server = createServer();
     let peer: Socket | undefined;
     let hello: { tabId?: string; paneId?: string } | undefined;
     let listening = false, started = false, finished = false;
     let streamError: string | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopDeadline: number | undefined;
     let settle!: (result: { code: number; error?: string }) => void;
     const done = new Promise<{ code: number; error?: string }>(resolve => { settle = resolve; });
     const finish = (code: number, error?: string) => {
@@ -93,6 +113,7 @@ export class HerdrDispatch {
       if (finished) return;
       if (!started) return finish(1);
       if (timer) return;
+      stopDeadline = performance.now() + STOP_TIMEOUT_MS;
       peer!.write('{"type":"stop"}\n');
       timer = setTimeout(() => finish(1, "Herdr worker did not confirm termination"), STOP_TIMEOUT_MS);
     };
@@ -103,7 +124,8 @@ export class HerdrDispatch {
       // Pass the same environment as headless, except for Herdr's own pane context.
       const env = Object.fromEntries(Object.entries(invocation.env).filter(([key]) => !key.startsWith("HERDR_")));
       started = true;
-      peer!.write(JSON.stringify({ type: "start", command: invocation.command, args: invocation.args, env }) + "\n");
+      this.pendingTermination = true;
+      peer!.write(JSON.stringify({ type: "start", command: invocation.command, args: invocation.args, env, stoppedPath }) + "\n");
     };
     server.on("connection", socket => {
       socket.on("error", () => {}); // close is the authoritative loss signal.
@@ -119,6 +141,7 @@ export class HerdrDispatch {
         else if (started && frame?.type === "stdout" && typeof frame.text === "string") output.stdout(frame.text);
         else if (started && frame?.type === "stderr" && typeof frame.text === "string") output.stderr(frame.text);
         else if (started && frame?.type === "exit" && Number.isInteger(frame.code) && frame.code >= 0) {
+          this.pendingTermination = false;
           const error = streamError ?? (typeof frame.error === "string" ? frame.error : undefined);
           finish(error ? frame.code || 1 : frame.code, error);
         } else if (started) {
@@ -162,6 +185,10 @@ export class HerdrDispatch {
       signal.removeEventListener("abort", abort);
       peer?.destroy();
       if (listening) await new Promise<void>(resolve => server.close(() => resolve()));
+      if (this.terminationUnconfirmed) {
+        this.pendingTermination = !(await confirmStopped(stoppedPath, stopDeadline ?? performance.now() + STOP_TIMEOUT_MS));
+        if (this.pendingTermination) output.stderr("Herdr worker termination could not be confirmed\n");
+      }
       await rm(dir, { recursive: true, force: true }).catch(error => {
         this.channelWarning = `Herdr worker channel cleanup: ${String(error)}`;
       });
@@ -174,16 +201,35 @@ export class HerdrDispatch {
     return [tabWarning, this.channelWarning].filter(Boolean).join("; ") || undefined;
   }
 
+  private async reconcileTab(socketPath: string): Promise<string | undefined> {
+    const deadline = performance.now() + ALLOCATION_RECONCILE_MS;
+    let lastError: unknown;
+    // A timed-out layout request can still allocate after the first list returns.
+    while (performance.now() < deadline) {
+      const timeout = Math.min(RPC_TIMEOUT_MS, deadline - performance.now());
+      const result = await rpc(socketPath, "tab.list", { workspace_id: this.workspaceId }, timeout).catch(error => {
+        if (this.allocation === "rejected") throw error;
+        lastError = error;
+      });
+      if (result) {
+        if (result.type !== "tab_list" || !Array.isArray(result.tabs)) throw new Error("Invalid tab list");
+        const matches = result.tabs.filter((tab: any) => tab?.workspace_id === this.workspaceId && tab.label === this.label && typeof tab.tab_id === "string");
+        if (matches.length > 1) throw new Error("Multiple tabs matched the worker's exact allocation label");
+        if (matches.length === 1) return matches[0].tab_id;
+        if (this.allocation === "rejected") return;
+        lastError = undefined;
+      }
+      const remaining = deadline - performance.now();
+      if (remaining > 0) await delay(Math.min(CHECK_INTERVAL_MS, remaining));
+    }
+    throw new Error(`Could not confirm whether the worker tab was created${lastError ? `: ${String(lastError)}` : ""}`);
+  }
+
   private async closeTab(): Promise<string | undefined> {
     const socketPath = this.env.HERDR_SOCKET_PATH!;
     try {
       if (this.allocation === "uncertain" || this.allocation === "rejected") {
-        const result = await rpc(socketPath, "tab.list", { workspace_id: this.workspaceId });
-        if (result.type !== "tab_list" || !Array.isArray(result.tabs)) throw new Error("Invalid tab list");
-        const matches = result.tabs.filter((tab: any) => tab?.workspace_id === this.workspaceId && tab.label === this.label && typeof tab.tab_id === "string");
-        if (!matches.length && this.allocation === "rejected") return;
-        if (matches.length !== 1) throw new Error("Could not confirm whether the worker tab was created");
-        this.tabId = matches[0].tab_id;
+        this.tabId = await this.reconcileTab(socketPath);
       }
       if (this.tabId) {
         const result = await rpc(socketPath, "tab.close", { tab_id: this.tabId });

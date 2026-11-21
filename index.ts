@@ -11,6 +11,7 @@ import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
 import { renderAgentGrid, type AgentCard } from "./widget-layout.ts";
 import { createAgentActivity } from "./activity.ts";
 import { HerdrDispatch, inHerdr, type WorkerInvocation, type WorkerOutput } from "./herdr-transport.ts";
+import { workerStop } from "./worker-stop.mjs";
 
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -22,6 +23,8 @@ const MAX_TOKENS_OVERRIDE = path.join(import.meta.dirname, "max-tokens-override.
 const RUN_ROOT = path.join(os.tmpdir(), "pi-subagents");
 const WORKFLOW_ROOT = path.join(getAgentDir(), "runtime", "subagent-workflows");
 const workflowMutations = new Map<string, Promise<void>>();
+// If workflow metadata cannot be written, preserve the safety guard in this process.
+const unpersistedStops = new Set<string>();
 async function mutateWorkflow<T>(workflowId: string, operation: () => Promise<T>): Promise<T> {
   const prior = workflowMutations.get(workflowId) ?? Promise.resolve();
   let release!: () => void;
@@ -78,12 +81,17 @@ interface Details { mode: "single" | "parallel" | "chain" | "workflow" | "manage
 interface WorkflowAgentRecord {
   workflowId: string; agentId: string; profile: string; builtin?: true; sessionDir: string; sessionFile?: string;
   status: Status; model?: string; thinking: ThinkingLevel; maxTokens?: number; cwd: string; createdAt: string; updatedAt: string;
-  ownerId: string; lastTask?: string; lastResult?: string; reason?: string;
+  ownerId: string; lastTask?: string; lastResult?: string; reason?: string; terminationUnconfirmed?: true;
   /** Cumulative child execution only; idle time between workflow dispatches is separate. */
   activeRunMs?: number; idleWaitingMs?: number; lastEndedAt?: string;
 }
 interface WorkflowRecord { workflowId: string; runDir: string; agents: Record<string, WorkflowAgentRecord>; createdAt: string; updatedAt: string; }
 const safeId = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_");
+const unconfirmedStop = (ownerId: string, record?: WorkflowAgentRecord) => unpersistedStops.has(ownerId) || record?.terminationUnconfirmed;
+const STOP_UNCONFIRMED = "Previous Herdr worker termination could not be confirmed";
+function requireStopped(ownerId: string, record?: WorkflowAgentRecord) {
+  if (unconfirmedStop(ownerId, record)) throw new Error(`${STOP_UNCONFIRMED}; workflow role is unavailable (${ownerId})`);
+}
 const workflowDir = (workflowId: string) => path.join(WORKFLOW_ROOT, safeId(workflowId));
 const workflowRecordPath = (workflowId: string) => path.join(workflowDir(workflowId), "workflow.json");
 async function readWorkflow(workflowId: string): Promise<WorkflowRecord | undefined> {
@@ -176,11 +184,26 @@ export function createChildMetrics(emit: (name: string, data: unknown) => void, 
   };
 }
 
-function trimOutput(text: string): string {
-  if (Buffer.byteLength(text) <= OUTPUT_CAP) return text;
-  let value = text.slice(0, OUTPUT_CAP);
-  while (Buffer.byteLength(value) > OUTPUT_CAP) value = value.slice(0, -1);
-  return `${value}\n\n[Output truncated to 50 KB]`;
+const TRUNCATED = "\n\n[Output truncated to 50 KB]";
+function trimOutput(text: string, limit = OUTPUT_CAP): string {
+  if (Buffer.byteLength(text) <= limit) return text;
+  const bytes = Buffer.from(text);
+  let end = limit - Buffer.byteLength(TRUNCATED);
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.toString("utf8", 0, end) + TRUNCATED;
+}
+
+/** Keep each short field intact; large fields share whatever budget remains. */
+function capResultText(fields: Array<string | undefined>): Array<string | undefined> {
+  const ordered = fields.flatMap((text, index) => text ? [{ text, index, size: Buffer.byteLength(text) }] : [])
+    .sort((a, b) => a.size - b.size);
+  let remaining = OUTPUT_CAP;
+  ordered.forEach(({ text, index }, i) => {
+    const bounded = trimOutput(text, Math.floor(remaining / (ordered.length - i)));
+    fields[index] = bounded;
+    remaining -= Buffer.byteLength(bounded);
+  });
+  return fields;
 }
 function finalText(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -219,18 +242,13 @@ function runHeadless(invocation: WorkerInvocation, signal: AbortSignal, output: 
   if (signal.aborted) return Promise.resolve(1);
   const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd, stdio: ["ignore", "pipe", "pipe"], env: invocation.env });
   return new Promise(resolve => {
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const stop = () => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-    };
+    const { request: stop, clear } = workerStop(child);
     signal.addEventListener("abort", stop, { once: true });
     child.stdout.setEncoding("utf8").on("data", output.stdout);
     child.stderr.setEncoding("utf8").on("data", output.stderr);
     child.on("error", error => output.stderr(error.message));
     child.once("close", code => {
-      clearTimeout(killTimer);
+      clear();
       signal.removeEventListener("abort", stop);
       resolve(code ?? 1);
     });
@@ -255,7 +273,7 @@ export default function (pi: ExtensionAPI) {
     });
   };
   const active = new Map<string, ActiveTask>();
-  const children = new Map<string, (reason: string) => void>();
+  const workerStops = new Map<string, (reason: string) => void>();
   const dispatches = new Set<Promise<unknown>>();
   const workflowRuns = new Map<string, Promise<void>>();
   const closingWorkflows = new Set<string>();
@@ -294,7 +312,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => { widgetCtx = ctx; shuttingDown = false; await removeOldFailedRuns(); updateWidget(); });
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
-    for (const stop of children.values()) stop("Parent session shut down");
+    for (const stop of workerStops.values()) stop("Parent session shut down");
     for (const job of backgroundJobs.values()) { job.cancelled = true; job.controller.abort(); }
     await Promise.allSettled(dispatches);
     widgetCtx = undefined;
@@ -309,16 +327,18 @@ export default function (pi: ExtensionAPI) {
         // A run may be preparing before its first registry write. Mark it closing and await
         // every reserved run before deciding whether workflow metadata exists.
         let workflow = await readWorkflow(workflowId);
-        const stop = (ownerId: string) => children.get(ownerId)?.("Workflow closed");
+        const stop = (ownerId: string) => workerStops.get(ownerId)?.("Workflow closed");
         for (const agent of Object.values(workflow?.agents ?? {})) stop(agent.ownerId);
-        for (const ownerId of children.keys()) if (ownerId.startsWith(`${safeId(workflowId)}:`)) stop(ownerId);
+        for (const ownerId of workerStops.keys()) if (ownerId.startsWith(`${safeId(workflowId)}:`)) stop(ownerId);
         const runs = [...workflowRuns.entries()].filter(([id]) => id.startsWith(`${safeId(workflowId)}:`)).map(([, run]) => run);
         await Promise.all(runs);
+        for (const ownerId of unpersistedStops) if (ownerId.startsWith(`${safeId(workflowId)}:`)) requireStopped(ownerId);
         workflow = await readWorkflow(workflowId);
         if (!workflow) return `Workflow ${workflowId} is already closed`;
         return await mutateWorkflow(workflowId, async () => {
           const current = await readWorkflow(workflowId);
           if (!current) return `Workflow ${workflowId} is already closed`;
+          for (const agent of Object.values(current.agents)) requireStopped(agent.ownerId, agent);
           const failedAgents = Object.values(current.agents).filter(a => a.status === "failed" || a.status === "aborted");
           // Successful child sessions never accompany retained failed diagnostics.
           await Promise.all(Object.values(current.agents).filter(a => a.status === "done").map(a => fs.promises.rm(a.sessionDir, { recursive: true, force: true })));
@@ -398,6 +418,7 @@ export default function (pi: ExtensionAPI) {
         // Fresh reviewers get a new directory/context. The running-run guard above
         // makes this reset safe: it never deletes a live persisted session.
         const validateIdentity = (prior: WorkflowAgentRecord | undefined) => {
+          requireStopped(id, prior);
           if (!prior) return;
           if (!profiles && (prior.profile !== agent.name || prior.builtin !== true)) throw new Error("Cannot resume a named-profile workflow as general-purpose. Relaunch with PI_SUBAGENT_PROFILES=1 or use a new workflow identity.");
           if ((profiles && prior.builtin === true) || prior.profile !== agent.name || prior.cwd !== path.resolve(spec.cwd)) throw new Error("A workflow agent cannot change profile or working directory when resumed");
@@ -464,7 +485,7 @@ export default function (pi: ExtensionAPI) {
               if (e.message.role === "assistant") { const u = e.message.usage; usage.turns++; usage.input += u?.input ?? 0; usage.output += u?.output ?? 0; usage.cost += u?.cost?.total ?? 0; state.contextTokens = u?.totalTokens ?? 0; state.modelUsed = e.message.model; stopReason = e.message.stopReason ?? stopReason; errorMessage = e.message.errorMessage ?? errorMessage; }
               if (e.message.role === "assistant") { activityTurns++; activityTokens = e.message.usage?.totalTokens; publishActivity(); }
               try {
-                onUpdate?.({ content: [{ type: "text", text: finalText(messages) || `${agent.name} is working...` }], details: { mode: "single", results: [] } });
+                onUpdate?.({ content: [{ type: "text", text: trimOutput(finalText(messages)) || `${agent.name} is working...` }], details: { mode: "single", results: [] } });
               } catch { /* A disconnected observer must not interrupt the worker. */ }
               updateWidget();
             }
@@ -473,7 +494,7 @@ export default function (pi: ExtensionAPI) {
           stdout(text) { const lines = (buffer + text).split("\n"); buffer = lines.pop() ?? ""; lines.forEach(line); },
           stderr(text) { stderr += text; },
         };
-        children.set(id, stop);
+        workerStops.set(id, stop);
         const timer = setTimeout(() => stop(`Timed out after ${timeout / 60_000} minutes`, false), timeout);
         if (shuttingDown) stop("Parent session shut down");
         else if (workflowLifecycle && closingWorkflows.has(params.workflowId!)) stop("Workflow closed");
@@ -488,17 +509,17 @@ export default function (pi: ExtensionAPI) {
           stderr += `${herdr ? "Herdr launch/transport failed: " : "Child launch failed: "}${error instanceof Error ? error.message : String(error)}\n`;
           exitCode = 1;
         } finally {
-          children.delete(id);
+          workerStops.delete(id);
+          if (workflowLifecycle && herdr?.terminationUnconfirmed) unpersistedStops.add(id);
           clearTimeout(timer);
           signal?.removeEventListener("abort", abort);
         }
         if (buffer.trim()) line(buffer);
-        const output = trimOutput(finalText(messages)); const failed = exitCode !== 0 || stopReason === "error" || stopReason === "aborted" || Boolean(state.reason);
+        const failed = exitCode !== 0 || stopReason === "error" || stopReason === "aborted" || Boolean(state.reason);
         state.status = cancelled ? "aborted" : failed ? "failed" : "done";
-        state.output = output;
-        const stderrSummary = failed ? trimOutput(stderr.trim()) : "";
-        state.reason ||= errorMessage || (failed ? stderrSummary || `Child exited with code ${exitCode}` : undefined);
-        if (stderrSummary && stderrSummary !== state.reason) diagnostics = stderrSummary;
+        const failureStderr = failed ? stderr.trim() : "";
+        const reason = state.reason || errorMessage || (failed ? failureStderr || `Child exited with code ${exitCode}` : undefined);
+        [state.reason, diagnostics, state.output] = capResultText([reason, failureStderr && failureStderr !== reason ? failureStderr : undefined, finalText(messages)]);
         state.currentTool = undefined; state.currentToolStartedAt = undefined; updateWidget();
         if (workflowLifecycle) await mutateWorkflow(params.workflowId!, async () => {
           workflow = await readWorkflow(params.workflowId!);
@@ -507,8 +528,10 @@ export default function (pi: ExtensionAPI) {
             const record = workflow.agents[params.agentId!]; record.sessionFile = files.length ? path.join(sessionDir, files[files.length - 1]) : record.sessionFile;
             record.status = state.status; record.updatedAt = new Date().toISOString(); record.lastEndedAt = record.updatedAt;
             record.activeRunMs = (record.activeRunMs ?? 0) + Math.max(0, Date.now() - (state.startedAt ?? Date.now()));
-            record.lastResult = output.slice(0, 2000); record.reason = state.reason;
+            record.lastResult = state.output?.slice(0, 2000); record.reason = state.reason;
+            if (herdr?.terminationUnconfirmed) record.terminationUnconfirmed = true;
             await writeWorkflow(workflow);
+            unpersistedStops.delete(id);
           }
         });
         completedSuccessfully = true;
@@ -521,7 +544,9 @@ export default function (pi: ExtensionAPI) {
               if (!workflow || !record || !settleExceptionalWorkflowTiming(record, workflowStartedAt, endedAt, workflowAttemptPersisted)) return;
               record.status = state.status === "aborted" || closingWorkflows.has(params.workflowId!) || closingAgents.has(id) ? "aborted" : "failed";
               record.reason = activityError; record.updatedAt = new Date(endedAt).toISOString(); record.lastEndedAt = record.updatedAt;
+              if (herdr?.terminationUnconfirmed) record.terminationUnconfirmed = true;
               await writeWorkflow(workflow);
+              unpersistedStops.delete(id);
             });
           } catch (persistenceError) {
             warn(ctx, `Could not record subagent failure: ${String(persistenceError)}`);
@@ -551,7 +576,8 @@ export default function (pi: ExtensionAPI) {
       if (!workflowLifecycle && !failed.length) await fs.promises.rm(runDir, { recursive: true, force: true });
       const summaries = results.map(r => {
         const outcome = r.status === "done" ? r.output || "(no output)" : `Reason: ${r.reason || "unknown failure"}\nSession: ${r.sessionDir}`;
-        return [`### ${r.agent} — ${r.status}`, outcome, r.diagnostics && `Diagnostics: ${r.diagnostics}`, r.cleanupWarning && `Warning: ${r.cleanupWarning}`].filter(Boolean).join("\n");
+        return trimOutput([`### ${r.agent} — ${r.status}`, r.cleanupWarning && `Warning: ${r.cleanupWarning}`, outcome,
+          r.diagnostics && `Diagnostics: ${r.diagnostics}`, r.status !== "done" && r.output && `Partial output: ${r.output}`].filter(Boolean).join("\n"));
       });
         return { content: [{ type: "text" as const, text: `${results.length - failed.length}/${results.length} subagents completed\n\n${summaries.join("\n\n---\n\n")}` }], details: { mode: workflowLifecycle ? "workflow" : params.chain?.length ? "chain" : params.tasks?.length ? "parallel" : "single", results } as Details };
       } finally {
@@ -667,7 +693,7 @@ export default function (pi: ExtensionAPI) {
         const workflowText = workflows.length ? workflows.map(w => `${w.workflowId}: ${Object.values(w.agents).map(a => {
           const active = a.activeRunMs ?? 0;
           const idle = (a.idleWaitingMs ?? 0) + (a.status !== "running" && a.lastEndedAt ? Math.max(0, Date.now() - Date.parse(a.lastEndedAt)) : 0);
-          return `${a.agentId}=${a.status} (cumulative active run time ${active}ms; persistent idle/waiting time ${idle}ms)`;
+          return `${a.agentId}=${a.status}${unconfirmedStop(a.ownerId, a) ? " (unavailable: worker termination unconfirmed)" : ""} (cumulative active run time ${active}ms; persistent idle/waiting time ${idle}ms)`;
         }).join(", ") || "no agents"}`).join("\n") : "No workflow agents.";
         const jobs = describeJobs();
         const text = `${workflowText}\n\n${jobs.length ? `Background jobs:\n${jobs.join("\n")}` : "No background jobs."}`;
@@ -683,10 +709,11 @@ export default function (pi: ExtensionAPI) {
         if (closingAgents.has(ownerId)) throw new Error(`Workflow agent ${params.workflowId}/${params.agentId} is already closing`);
         closingAgents.add(ownerId);
         try {
-          children.get(ownerId)?.("Agent closed");
+          workerStops.get(ownerId)?.("Agent closed");
           await workflowRuns.get(ownerId);
           await mutateWorkflow(params.workflowId, async () => {
             const workflow = await readWorkflow(params.workflowId!); const agent = workflow?.agents[params.agentId!];
+            requireStopped(ownerId, agent);
             if (!workflow || !agent) throw new Error(`Unknown workflow agent: ${params.workflowId}/${params.agentId}`);
             const failed = agent.status === "failed" || agent.status === "aborted";
             if (!failed) await fs.promises.rm(agent.sessionDir, { recursive: true, force: true });
